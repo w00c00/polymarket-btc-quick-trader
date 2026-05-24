@@ -185,14 +185,16 @@ class PolyQuickTrader:
         self.ent_paper_decision_lead_seconds.pack(side="left", padx=4)
         ttk.Label(paper_row2, text="模拟轮数:").pack(side="left", padx=(8, 4))
         self.ent_paper_rounds = ttk.Entry(paper_row2, width=7)
-        self.ent_paper_rounds.insert(0, "4")
+        self.ent_paper_rounds.insert(0, "40")
         self.ent_paper_rounds.pack(side="left", padx=4)
         ttk.Label(paper_row2, text="最多小时:").pack(side="left", padx=(8, 4))
         self.ent_paper_max_hours = ttk.Entry(paper_row2, width=7)
-        self.ent_paper_max_hours.insert(0, "2")
+        self.ent_paper_max_hours.insert(0, "12")
         self.ent_paper_max_hours.pack(side="left", padx=4)
+        self.btn_overnight_paper = ttk.Button(paper_row2, text="通宵参数", width=12, command=self.apply_overnight_paper_defaults)
+        self.btn_overnight_paper.pack(side="left", padx=(10, 4))
         self.btn_stop_paper_strategy = ttk.Button(paper_row2, text="停止模拟", width=12, command=self.stop_paper_strategy_clicked, state="disabled")
-        self.btn_stop_paper_strategy.pack(side="left", padx=(10, 4))
+        self.btn_stop_paper_strategy.pack(side="left", padx=4)
 
         self.lbl_quick_signal = ttk.Label(quick_frame, text="只做辅助判断；每次真实下单前都会确认。", foreground="#475569")
         self.lbl_quick_signal.pack(fill="x", pady=(0, 8))
@@ -388,14 +390,21 @@ class PolyQuickTrader:
             self._set_entry(self.ent_paper_take_profit, config.get("paper_take_profit", "0.60"))
             self._set_entry(self.ent_paper_poll_seconds, config.get("paper_poll_seconds", "3"))
             self._set_entry(self.ent_paper_decision_lead_seconds, config.get("paper_decision_lead_seconds", "120"))
-            self._set_entry(self.ent_paper_rounds, config.get("paper_rounds", "4"))
-            self._set_entry(self.ent_paper_max_hours, config.get("paper_max_hours", "2"))
+            self._set_entry(self.ent_paper_rounds, config.get("paper_rounds", "40"))
+            self._set_entry(self.ent_paper_max_hours, config.get("paper_max_hours", "12"))
         except Exception as e:
             logging.error("加载配置文件失败: %s", e)
 
     def _set_entry(self, entry, value):
         entry.delete(0, tk.END)
         entry.insert(0, str(value))
+
+    def apply_overnight_paper_defaults(self):
+        self._set_entry(self.ent_paper_poll_seconds, "3")
+        self._set_entry(self.ent_paper_decision_lead_seconds, "120")
+        self._set_entry(self.ent_paper_rounds, "40")
+        self._set_entry(self.ent_paper_max_hours, "12")
+        self.logger.info("已套用通宵模拟参数: 40 轮 / 12 小时 / 轮询 3 秒 / 开盘前 120 秒判断。")
 
     def validate_credentials_config(self):
         config = {

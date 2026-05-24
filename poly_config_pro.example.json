@@ -7,6 +7,6 @@
     "paper_take_profit": "0.60",
     "paper_poll_seconds": "3",
     "paper_decision_lead_seconds": "120",
-    "paper_rounds": "4",
-    "paper_max_hours": "2"
+    "paper_rounds": "40",
+    "paper_max_hours": "12"
 }
