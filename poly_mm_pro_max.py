@@ -75,6 +75,7 @@ class PolyQuickTrader:
         self.latest_quick_markets: list[QuickMarket] = []
         self.latest_positions = []
         self.latest_signal = None
+        self.paper_strategy_running = False
 
         self.logger = logging.getLogger("PolyQuickTrader")
         self.logger.setLevel(logging.INFO)
@@ -152,6 +153,27 @@ class PolyQuickTrader:
         self.btn_buy_up.pack(side="left", padx=4)
         self.btn_buy_down = ttk.Button(quick_ctrl_frame, text="买 Down", width=10, command=lambda: self.buy_selected_quick_market("DOWN"))
         self.btn_buy_down.pack(side="left", padx=4)
+        self.btn_paper_strategy = ttk.Button(quick_ctrl_frame, text="模拟自动策略", width=16, command=self.paper_strategy_button_clicked)
+        self.btn_paper_strategy.pack(side="left", padx=4)
+
+        paper_frame = ttk.Frame(quick_frame)
+        paper_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(paper_frame, text="模拟入场上限:").pack(side="left", padx=(4, 4))
+        self.ent_paper_max_entry = ttk.Entry(paper_frame, width=7)
+        self.ent_paper_max_entry.insert(0, "0.52")
+        self.ent_paper_max_entry.pack(side="left", padx=4)
+        ttk.Label(paper_frame, text="模拟止盈:").pack(side="left", padx=(8, 4))
+        self.ent_paper_take_profit = ttk.Entry(paper_frame, width=7)
+        self.ent_paper_take_profit.insert(0, "0.60")
+        self.ent_paper_take_profit.pack(side="left", padx=4)
+        ttk.Label(paper_frame, text="最小概率:").pack(side="left", padx=(8, 4))
+        self.ent_paper_min_prob = ttk.Entry(paper_frame, width=7)
+        self.ent_paper_min_prob.insert(0, "0.60")
+        self.ent_paper_min_prob.pack(side="left", padx=4)
+        ttk.Label(paper_frame, text="轮询秒:").pack(side="left", padx=(8, 4))
+        self.ent_paper_poll_seconds = ttk.Entry(paper_frame, width=7)
+        self.ent_paper_poll_seconds.insert(0, "10")
+        self.ent_paper_poll_seconds.pack(side="left", padx=4)
 
         self.lbl_quick_signal = ttk.Label(quick_frame, text="只做辅助判断；每次真实下单前都会确认。", foreground="#475569")
         self.lbl_quick_signal.pack(fill="x", pady=(0, 8))
@@ -275,6 +297,10 @@ class PolyQuickTrader:
             "signature_type": self.cbo_signature_type.get(),
             "quick_usdc": self.ent_quick_usdc.get().strip(),
             "quick_max_price": self.ent_quick_max_price.get().strip(),
+            "paper_max_entry": self.ent_paper_max_entry.get().strip(),
+            "paper_take_profit": self.ent_paper_take_profit.get().strip(),
+            "paper_min_prob": self.ent_paper_min_prob.get().strip(),
+            "paper_poll_seconds": self.ent_paper_poll_seconds.get().strip(),
         }
 
     def save_config_to_local(self):
@@ -300,6 +326,10 @@ class PolyQuickTrader:
                 self.cbo_signature_type.set(str(config.get("signature_type")).strip())
             self._set_entry(self.ent_quick_usdc, config.get("quick_usdc", "5"))
             self._set_entry(self.ent_quick_max_price, config.get("quick_max_price", "0.60"))
+            self._set_entry(self.ent_paper_max_entry, config.get("paper_max_entry", "0.52"))
+            self._set_entry(self.ent_paper_take_profit, config.get("paper_take_profit", "0.60"))
+            self._set_entry(self.ent_paper_min_prob, config.get("paper_min_prob", "0.60"))
+            self._set_entry(self.ent_paper_poll_seconds, config.get("paper_poll_seconds", "10"))
         except Exception as e:
             logging.error("加载配置文件失败: %s", e)
 
@@ -843,6 +873,205 @@ class PolyQuickTrader:
                     llm.get("risk", ""),
                     (llm.get("usage") or {}).get("total_tokens", "--"),
                 )
+
+    def paper_strategy_button_clicked(self):
+        if self.paper_strategy_running:
+            messagebox.showinfo("模拟策略", "模拟自动策略正在运行中。")
+            return
+        try:
+            config = {
+                "usdc": float(self.ent_quick_usdc.get().strip()),
+                "max_entry": float(self.ent_paper_max_entry.get().strip()),
+                "take_profit": float(self.ent_paper_take_profit.get().strip()),
+                "min_prob": float(self.ent_paper_min_prob.get().strip()),
+                "poll_seconds": float(self.ent_paper_poll_seconds.get().strip()),
+            }
+        except ValueError:
+            messagebox.showerror("参数错误", "模拟策略参数必须是数字。")
+            return
+        if config["usdc"] <= 0 or not (0 < config["max_entry"] < config["take_profit"] < 1) or not (0.5 <= config["min_prob"] <= 1):
+            messagebox.showerror("参数错误", "请确认：金额>0，0<入场上限<止盈<1，最小概率在 0.5 到 1 之间。")
+            return
+        if config["poll_seconds"] < 3:
+            messagebox.showerror("参数错误", "轮询秒数不要低于 3 秒。")
+            return
+
+        self.paper_strategy_running = True
+        self.btn_paper_strategy.configure(state="disabled", text="模拟运行中")
+        self.logger.info(
+            "启动模拟自动策略: 下一轮15m | max_entry=%.2f | take_profit=%.2f | min_prob=%.2f",
+            config["max_entry"],
+            config["take_profit"],
+            config["min_prob"],
+        )
+
+        def worker():
+            loop = asyncio.new_event_loop()
+            try:
+                result = loop.run_until_complete(self.run_paper_next_15m_strategy(config))
+                self.root.after(0, lambda result=result: self.logger.info("模拟策略结束: %s", result))
+            except Exception as e:
+                error_text = str(e) or repr(e)
+                self.root.after(0, lambda err=error_text: self.logger.error("模拟策略失败: %s", err))
+            finally:
+                loop.close()
+                self.paper_strategy_running = False
+                self.root.after(0, lambda: self.btn_paper_strategy.configure(state="normal", text="模拟自动策略"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    async def run_paper_next_15m_strategy(self, config):
+        market = await self.fetch_next_15m_market()
+        if not market:
+            raise RuntimeError("没有找到下一轮 15m 市场")
+
+        self.logger.info("模拟目标市场: %s | %s | end=%s", market.slug, market.question, market.end_dt)
+        signal = await self.fetch_btc_signal(market)
+        minimax_key = self.ent_minimax_key.get().strip()
+        decision = await self.fetch_minimax_prediction(signal, minimax_key, market) if minimax_key else self.local_structured_decision(signal, market, "未配置 MiniMax")
+        action = decision.get("action", "NO_TRADE")
+        direction = "UP" if action == "BUY_UP" else "DOWN" if action == "BUY_DOWN" else ""
+        prob = decision.get("prob_up", 0.5) if direction == "UP" else decision.get("prob_down", 0.5) if direction == "DOWN" else 0.0
+
+        self.logger.info(
+            "模拟入场判断: action=%s prob=%.1f%% source=%s reason=%s",
+            action,
+            prob * 100,
+            decision.get("source", "MINIMAX"),
+            decision.get("reason", ""),
+        )
+        if action == "NO_TRADE" or not direction:
+            result = f"NO_TRADE | {decision.get('reason', '')}"
+            await self.push_paper_strategy_result("未入场", market, decision, None, result)
+            return result
+        if prob < config["min_prob"]:
+            result = f"未入场: 概率 {prob:.2f} 低于阈值 {config['min_prob']:.2f}"
+            await self.push_paper_strategy_result("未入场", market, decision, None, result)
+            return result
+
+        market = await self.fetch_market_by_slug(market.slug) or market
+        entry = market.up_ask if direction == "UP" else market.down_ask
+        if entry > config["max_entry"]:
+            result = f"未入场: {direction} ask={entry:.2f} 高于上限 {config['max_entry']:.2f}"
+            await self.push_paper_strategy_result("未入场", market, decision, None, result)
+            return result
+
+        paper = {
+            "direction": direction,
+            "entry": entry,
+            "size": config["usdc"] / entry,
+            "notional": config["usdc"],
+            "take_profit": config["take_profit"],
+            "entered_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "start_price": None,
+            "exit": None,
+            "exit_reason": "",
+        }
+        self.logger.info("模拟买入: %s entry=%.4f size=%.4f notional=%.2f", direction, paper["entry"], paper["size"], paper["notional"])
+
+        start_ts = self.market_start_timestamp(market)
+        if start_ts and time.time() < start_ts:
+            wait_seconds = min(max(0, start_ts - time.time()), 1200)
+            self.logger.info("模拟等待周期开始: %.0f 秒", wait_seconds)
+            await asyncio.sleep(wait_seconds)
+        paper["start_price"] = await self.fetch_latest_btc_price()
+
+        while True:
+            now = datetime.now(timezone.utc)
+            latest = await self.fetch_market_by_slug(market.slug)
+            if latest:
+                market = latest
+            sell_bid = market.up_bid if direction == "UP" else market.down_bid
+            self.logger.info("模拟监控: %s sell_bid=%.4f target=%.4f", direction, sell_bid, paper["take_profit"])
+            if sell_bid >= paper["take_profit"]:
+                paper["exit"] = sell_bid
+                paper["exit_reason"] = "TAKE_PROFIT"
+                break
+            if market.end_dt and now >= market.end_dt:
+                end_price = await self.fetch_latest_btc_price()
+                up_wins = end_price >= paper["start_price"] if paper["start_price"] else False
+                direction_wins = (direction == "UP" and up_wins) or (direction == "DOWN" and not up_wins)
+                paper["exit"] = 1.0 if direction_wins else 0.0
+                paper["exit_reason"] = "SETTLED_WIN" if direction_wins else "SETTLED_LOSS"
+                paper["end_price"] = end_price
+                break
+            await asyncio.sleep(config["poll_seconds"])
+
+        pnl = (paper["exit"] - paper["entry"]) * paper["size"]
+        paper["pnl"] = pnl
+        paper["pnl_pct"] = pnl / paper["notional"] * 100
+        result = f"{paper['exit_reason']} | {direction} entry={paper['entry']:.4f} exit={paper['exit']:.4f} pnl={pnl:+.2f} USDC ({paper['pnl_pct']:+.2f}%)"
+        await self.push_paper_strategy_result("已结束", market, decision, paper, result)
+        return result
+
+    async def fetch_next_15m_market(self):
+        now_ts = int(time.time())
+        base = now_ts - (now_ts % 900)
+        candidates = [base + 900, base + 1800, base]
+        for start_ts in candidates:
+            if start_ts < now_ts - 60:
+                continue
+            market = await self.fetch_market_by_slug(f"btc-updown-15m-{start_ts}")
+            if market and not market.ended:
+                return market
+        return None
+
+    async def fetch_market_by_slug(self, slug: str):
+        event = await self.fetch_json(f"{GAMMA_EVENT_SLUG_URL}/{slug}")
+        if not isinstance(event, dict):
+            return None
+        now = datetime.now(timezone.utc)
+        for market in event.get("markets") or []:
+            item = self.quick_market_candidate(event, market, now)
+            if item:
+                return item
+        return None
+
+    def market_start_timestamp(self, market: QuickMarket):
+        match = re.search(r"btc-updown-\d+m-(\d+)", market.slug)
+        if not match:
+            return None
+        return int(match.group(1))
+
+    async def fetch_latest_btc_price(self):
+        url = "https://api.binance.com/api/v3/ticker/price"
+        params = {"symbol": "BTCUSDT"}
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"Binance ticker HTTP {response.status}")
+                    data = await response.json()
+                    return float(data["price"])
+        except Exception:
+            url = "https://data-api.binance.vision/api/v3/ticker/price"
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"Binance vision ticker HTTP {response.status}")
+                    data = await response.json()
+                    return float(data["price"])
+
+    async def push_paper_strategy_result(self, status, market, decision, paper, result):
+        content = (
+            "### Polymarket 模拟自动策略\n\n"
+            f"- 状态: `{status}`\n"
+            f"- 市场: `{market.slug}`\n"
+            f"- 标题: {market.question}\n"
+            f"- 建议: `{decision.get('action')}`\n"
+            f"- 概率: Up `{decision.get('prob_up', 0) * 100:.1f}%` / Down `{decision.get('prob_down', 0) * 100:.1f}%`\n"
+            f"- 来源: `{decision.get('source', 'MINIMAX')}`\n"
+            f"- 结果: `{result}`\n"
+        )
+        if paper:
+            content += (
+                f"\n- 方向: `{paper['direction']}`\n"
+                f"- 入场: `{paper['entry']:.4f}`\n"
+                f"- 出场: `{paper['exit']:.4f}`\n"
+                f"- 数量: `{paper['size']:.4f}`\n"
+                f"- 盈亏: `{paper['pnl']:+.2f}` USDC (`{paper['pnl_pct']:+.2f}%`)\n"
+            )
+        await self.push_to_server_chan("Polymarket 模拟策略结果", content)
 
     def buy_selected_quick_market(self, direction: str):
         market = self.selected_quick_market()
