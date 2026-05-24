@@ -6,5 +6,6 @@
     "paper_max_entry": "0.52",
     "paper_take_profit": "0.60",
     "paper_min_prob": "0.60",
-    "paper_poll_seconds": "10"
+    "paper_poll_seconds": "10",
+    "paper_decision_lead_seconds": "120"
 }

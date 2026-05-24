@@ -174,6 +174,10 @@ class PolyQuickTrader:
         self.ent_paper_poll_seconds = ttk.Entry(paper_frame, width=7)
         self.ent_paper_poll_seconds.insert(0, "10")
         self.ent_paper_poll_seconds.pack(side="left", padx=4)
+        ttk.Label(paper_frame, text="开盘前判断秒:").pack(side="left", padx=(8, 4))
+        self.ent_paper_decision_lead_seconds = ttk.Entry(paper_frame, width=7)
+        self.ent_paper_decision_lead_seconds.insert(0, "120")
+        self.ent_paper_decision_lead_seconds.pack(side="left", padx=4)
 
         self.lbl_quick_signal = ttk.Label(quick_frame, text="只做辅助判断；每次真实下单前都会确认。", foreground="#475569")
         self.lbl_quick_signal.pack(fill="x", pady=(0, 8))
@@ -301,6 +305,7 @@ class PolyQuickTrader:
             "paper_take_profit": self.ent_paper_take_profit.get().strip(),
             "paper_min_prob": self.ent_paper_min_prob.get().strip(),
             "paper_poll_seconds": self.ent_paper_poll_seconds.get().strip(),
+            "paper_decision_lead_seconds": self.ent_paper_decision_lead_seconds.get().strip(),
         }
 
     def save_config_to_local(self):
@@ -330,6 +335,7 @@ class PolyQuickTrader:
             self._set_entry(self.ent_paper_take_profit, config.get("paper_take_profit", "0.60"))
             self._set_entry(self.ent_paper_min_prob, config.get("paper_min_prob", "0.60"))
             self._set_entry(self.ent_paper_poll_seconds, config.get("paper_poll_seconds", "10"))
+            self._set_entry(self.ent_paper_decision_lead_seconds, config.get("paper_decision_lead_seconds", "120"))
         except Exception as e:
             logging.error("加载配置文件失败: %s", e)
 
@@ -885,6 +891,7 @@ class PolyQuickTrader:
                 "take_profit": float(self.ent_paper_take_profit.get().strip()),
                 "min_prob": float(self.ent_paper_min_prob.get().strip()),
                 "poll_seconds": float(self.ent_paper_poll_seconds.get().strip()),
+                "decision_lead_seconds": float(self.ent_paper_decision_lead_seconds.get().strip()),
             }
         except ValueError:
             messagebox.showerror("参数错误", "模拟策略参数必须是数字。")
@@ -895,14 +902,18 @@ class PolyQuickTrader:
         if config["poll_seconds"] < 3:
             messagebox.showerror("参数错误", "轮询秒数不要低于 3 秒。")
             return
+        if config["decision_lead_seconds"] < 0 or config["decision_lead_seconds"] > 600:
+            messagebox.showerror("参数错误", "开盘前判断秒建议在 0 到 600 秒之间。")
+            return
 
         self.paper_strategy_running = True
         self.btn_paper_strategy.configure(state="disabled", text="模拟运行中")
         self.logger.info(
-            "启动模拟自动策略: 下一轮15m | max_entry=%.2f | take_profit=%.2f | min_prob=%.2f",
+            "启动模拟自动策略: 下一轮15m | max_entry=%.2f | take_profit=%.2f | min_prob=%.2f | lead=%.0fs",
             config["max_entry"],
             config["take_profit"],
             config["min_prob"],
+            config["decision_lead_seconds"],
         )
 
         def worker():
@@ -926,6 +937,18 @@ class PolyQuickTrader:
             raise RuntimeError("没有找到下一轮 15m 市场")
 
         self.logger.info("模拟目标市场: %s | %s | end=%s", market.slug, market.question, market.end_dt)
+        start_ts = self.market_start_timestamp(market)
+        if start_ts:
+            decision_ts = start_ts - config["decision_lead_seconds"]
+            wait_seconds = decision_ts - time.time()
+            if wait_seconds > 0:
+                decision_time = datetime.fromtimestamp(decision_ts).astimezone().strftime("%H:%M:%S")
+                self.logger.info("模拟等待到开盘前 %.0f 秒再判断: 约 %s，等待 %.0f 秒", config["decision_lead_seconds"], decision_time, wait_seconds)
+                await asyncio.sleep(wait_seconds)
+            else:
+                self.logger.info("当前已进入开盘前 %.0f 秒窗口，立即判断。", config["decision_lead_seconds"])
+            market = await self.fetch_market_by_slug(market.slug) or market
+
         signal = await self.fetch_btc_signal(market)
         minimax_key = self.ent_minimax_key.get().strip()
         decision = await self.fetch_minimax_prediction(signal, minimax_key, market) if minimax_key else self.local_structured_decision(signal, market, "未配置 MiniMax")
@@ -969,7 +992,6 @@ class PolyQuickTrader:
         }
         self.logger.info("模拟买入: %s entry=%.4f size=%.4f notional=%.2f", direction, paper["entry"], paper["size"], paper["notional"])
 
-        start_ts = self.market_start_timestamp(market)
         if start_ts and time.time() < start_ts:
             wait_seconds = min(max(0, start_ts - time.time()), 1200)
             self.logger.info("模拟等待周期开始: %.0f 秒", wait_seconds)

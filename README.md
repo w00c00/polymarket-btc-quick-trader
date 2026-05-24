@@ -8,7 +8,7 @@ Tkinter desktop tool for Polymarket BTC Up/Down short-cycle markets.
 - Computes local BTC short-term probability from Binance 1m candles.
 - Optionally asks MiniMax for a compact probability and action suggestion.
 - Manually confirmed Buy Up / Buy Down orders.
-- Paper-runs the next 15m strategy with entry cap, 0.60-style take profit, and result notification.
+- Paper-runs the next 15m strategy with a configurable pre-open decision window, entry cap, 0.60-style take profit, and result notification.
 - Position refresh and limit-sell flow.
 - ServerChan notification for submitted trades, including current position PnL snapshot.
 
