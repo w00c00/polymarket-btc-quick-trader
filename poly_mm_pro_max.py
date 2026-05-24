@@ -644,7 +644,7 @@ class PolyQuickTrader:
             "model": MINIMAX_MODEL,
             "temperature": 0.2,
             "top_p": 0.9,
-            "max_completion_tokens": 900,
+            "max_completion_tokens": 220,
             "response_format": {"type": "json_object"},
             "messages": [
                 {
@@ -676,25 +676,22 @@ class PolyQuickTrader:
         except Exception as e:
             error_text = f"{type(e).__name__}: {str(e) or repr(e)}"
             self.logger.error("MiniMax 大模型预测失败: %s", error_text)
-            return {"error": error_text}
+            return self.local_structured_decision(signal, selected_market, f"MiniMax请求失败: {error_text}")
 
         try:
             data = json.loads(body)
             content = data["choices"][0]["message"]["content"]
             finish_reason = data["choices"][0].get("finish_reason")
             if finish_reason == "length":
-                self.logger.warning("MiniMax 输出被截断，尝试二次 JSON 修复。")
-                fixed = await self.repair_minimax_json(api_key, content)
-                if fixed:
-                    fixed["usage"] = data.get("usage") or {}
-                    return fixed
-                return {"error": "MiniMax 输出被截断"}
+                self.logger.warning("MiniMax 输出被截断，改用本地结构化决策。")
+                return self.local_structured_decision(signal, selected_market, "MiniMax输出被截断")
             parsed = self.parse_minimax_json(content)
             parsed["usage"] = data.get("usage") or {}
+            parsed["source"] = "MINIMAX"
             return parsed
         except Exception as e:
             self.logger.error("MiniMax 返回解析失败: %s | 原文=%s", e, body[:500])
-            return {"error": f"返回解析失败: {e}"}
+            return self.local_structured_decision(signal, selected_market, f"MiniMax返回解析失败: {e}")
 
     async def post_minimax_with_retry(self, api_key: str, payload: dict):
         last_error = None
@@ -718,35 +715,6 @@ class PolyQuickTrader:
                     await asyncio.sleep(1.5)
         raise last_error
 
-    async def repair_minimax_json(self, api_key: str, content: str):
-        payload = {
-            "model": MINIMAX_MODEL,
-            "temperature": 0,
-            "max_completion_tokens": 300,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "只输出 JSON，不要解释。字段: prob_up, prob_down, action, confidence, edge_summary, reason, risk。",
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "把下面内容压缩成最终交易 JSON。若信息不足，action=NO_TRADE, confidence=LOW。\n"
-                        + (content or "")[-2500:]
-                    ),
-                },
-            ],
-        }
-        try:
-            body = await self.post_minimax_with_retry(api_key, payload)
-            data = json.loads(body)
-            parsed = self.parse_minimax_json(data["choices"][0]["message"]["content"])
-            return parsed
-        except Exception as e:
-            self.logger.warning("MiniMax 二次 JSON 修复失败: %s: %s", type(e).__name__, str(e) or repr(e))
-            return None
-
     def compact_signal(self, signal):
         return {
             "period": signal.get("market_period"),
@@ -760,6 +728,50 @@ class PolyQuickTrader:
             "r_slow": round(float(signal.get("ret_slow", 0)), 5),
             "rsi": round(float(signal.get("rsi", 50)), 2),
             "vol": round(float(signal.get("vol", 0)), 6),
+        }
+
+    def local_structured_decision(self, signal, selected_market: QuickMarket | None = None, fallback_reason=""):
+        prob_up = min(max(float(signal.get("prob_up", 0.5)), 0.0), 1.0)
+        prob_down = 1.0 - prob_up
+        confidence_value = abs(prob_up - 0.5) * 2.0
+        confidence = "LOW"
+        if confidence_value >= 0.55:
+            confidence = "HIGH"
+        elif confidence_value >= 0.30:
+            confidence = "MEDIUM"
+
+        action = "NO_TRADE"
+        edge_summary = "优势不足"
+        reason = "本地概率与盘口优势不够明确"
+        if selected_market:
+            up_ask = float(selected_market.up_ask)
+            down_ask = float(selected_market.down_ask)
+            up_edge = prob_up - up_ask
+            down_edge = prob_down - down_ask
+            min_edge = 0.04
+            if up_edge >= min_edge and confidence_value >= 0.25:
+                action = "BUY_UP"
+                edge_summary = f"Up 概率高于买价约 {up_edge * 100:.1f} 个百分点"
+                reason = "本地趋势偏上且相对盘口有正边际"
+            elif down_edge >= min_edge and confidence_value >= 0.25:
+                action = "BUY_DOWN"
+                edge_summary = f"Down 概率高于买价约 {down_edge * 100:.1f} 个百分点"
+                reason = "本地趋势偏下且相对盘口有正边际"
+        elif confidence_value >= 0.45:
+            action = "BUY_UP" if prob_up > prob_down else "BUY_DOWN"
+            edge_summary = "仅基于本地概率"
+            reason = "未选中盘口，无法校验赔率边际"
+
+        return {
+            "prob_up": prob_up,
+            "prob_down": prob_down,
+            "action": action,
+            "confidence": confidence,
+            "edge_summary": edge_summary,
+            "reason": reason,
+            "risk": fallback_reason or "短周期噪声高，必须控制仓位和价格上限",
+            "source": "LOCAL_FALLBACK",
+            "usage": {},
         }
 
     def parse_minimax_json(self, content: str):
@@ -794,8 +806,9 @@ class PolyQuickTrader:
                 text += " | MiniMax失败，已用本地信号"
             else:
                 action_map = {"BUY_UP": "买Up", "BUY_DOWN": "买Down", "NO_TRADE": "不交易"}
+                source_label = "MiniMax" if llm.get("source") != "LOCAL_FALLBACK" else "本地兜底"
                 text += (
-                    f" | MiniMax: Up {llm['prob_up'] * 100:.1f}% / Down {llm['prob_down'] * 100:.1f}% "
+                    f" | {source_label}: Up {llm['prob_up'] * 100:.1f}% / Down {llm['prob_down'] * 100:.1f}% "
                     f"| {action_map.get(llm.get('action'), '不交易')} | {llm.get('confidence', 'LOW')}"
                 )
         self.lbl_quick_signal.configure(text=text)
@@ -818,8 +831,10 @@ class PolyQuickTrader:
             if llm.get("error"):
                 self.logger.warning("MiniMax 综合预测不可用: %s", llm["error"])
             else:
+                source_label = "MiniMax综合" if llm.get("source") != "LOCAL_FALLBACK" else "本地兜底"
                 self.logger.info(
-                    "MiniMax综合: Up %.1f%% / Down %.1f%% | 动作=%s | 置信=%s | %s | 风险=%s | tokens=%s",
+                    "%s: Up %.1f%% / Down %.1f%% | 动作=%s | 置信=%s | %s | 风险=%s | tokens=%s",
+                    source_label,
                     llm["prob_up"] * 100,
                     llm["prob_down"] * 100,
                     llm.get("action"),
