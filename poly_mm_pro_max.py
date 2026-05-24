@@ -177,7 +177,7 @@ class PolyQuickTrader:
         self.ent_paper_take_profit.pack(side="left", padx=4)
         ttk.Label(paper_row1, text="轮询秒:").pack(side="left", padx=(8, 4))
         self.ent_paper_poll_seconds = ttk.Entry(paper_row1, width=7)
-        self.ent_paper_poll_seconds.insert(0, "10")
+        self.ent_paper_poll_seconds.insert(0, "3")
         self.ent_paper_poll_seconds.pack(side="left", padx=4)
         ttk.Label(paper_row2, text="开盘前判断秒:").pack(side="left", padx=(4, 4))
         self.ent_paper_decision_lead_seconds = ttk.Entry(paper_row2, width=7)
@@ -222,7 +222,7 @@ class PolyQuickTrader:
         paper_result_frame.pack(fill="x", pady=(8, 0))
         self.paper_tree = ttk.Treeview(
             paper_result_frame,
-            columns=("round", "status", "direction", "entry", "exit", "pnl", "pct", "slug"),
+            columns=("round", "status", "direction", "entry", "current", "high", "exit", "pnl", "pct", "slug"),
             show="headings",
             height=5,
         )
@@ -231,12 +231,25 @@ class PolyQuickTrader:
             "status": "结果",
             "direction": "方向",
             "entry": "买入",
+            "current": "当前可卖",
+            "high": "最高可卖",
             "exit": "卖出",
             "pnl": "盈亏",
             "pct": "盈亏%",
             "slug": "市场",
         }
-        paper_widths = {"round": 55, "status": 110, "direction": 60, "entry": 65, "exit": 65, "pnl": 75, "pct": 75, "slug": 470}
+        paper_widths = {
+            "round": 55,
+            "status": 105,
+            "direction": 55,
+            "entry": 60,
+            "current": 70,
+            "high": 70,
+            "exit": 60,
+            "pnl": 70,
+            "pct": 70,
+            "slug": 390,
+        }
         for col, title in paper_headings.items():
             self.paper_tree.heading(col, text=title)
             self.paper_tree.column(col, width=paper_widths[col], anchor="center" if col != "slug" else "w")
@@ -373,7 +386,7 @@ class PolyQuickTrader:
             self._set_entry(self.ent_quick_max_price, config.get("quick_max_price", "0.60"))
             self._set_entry(self.ent_paper_usdc, config.get("paper_usdc", "5"))
             self._set_entry(self.ent_paper_take_profit, config.get("paper_take_profit", "0.60"))
-            self._set_entry(self.ent_paper_poll_seconds, config.get("paper_poll_seconds", "10"))
+            self._set_entry(self.ent_paper_poll_seconds, config.get("paper_poll_seconds", "3"))
             self._set_entry(self.ent_paper_decision_lead_seconds, config.get("paper_decision_lead_seconds", "120"))
             self._set_entry(self.ent_paper_rounds, config.get("paper_rounds", "4"))
             self._set_entry(self.ent_paper_max_hours, config.get("paper_max_hours", "2"))
@@ -941,8 +954,8 @@ class PolyQuickTrader:
         if config["usdc"] <= 0 or not (0 < config["take_profit"] < 1):
             messagebox.showerror("参数错误", "请确认：金额>0，止盈价在 0 到 1 之间。")
             return
-        if config["poll_seconds"] < 3:
-            messagebox.showerror("参数错误", "轮询秒数不要低于 3 秒。")
+        if config["poll_seconds"] < 1:
+            messagebox.showerror("参数错误", "轮询秒数不要低于 1 秒。")
             return
         if config["decision_lead_seconds"] < 0 or config["decision_lead_seconds"] > 600:
             messagebox.showerror("参数错误", "开盘前判断秒建议在 0 到 600 秒之间。")
@@ -1115,6 +1128,8 @@ class PolyQuickTrader:
             "status": "OPEN",
             "direction": direction,
             "entry": paper["entry"],
+            "current": paper["entry"],
+            "high": paper["entry"],
             "exit": None,
             "pnl": 0.0,
             "pnl_pct": 0.0,
@@ -1158,7 +1173,24 @@ class PolyQuickTrader:
             if latest:
                 market = latest
             sell_bid = market.up_bid if direction == "UP" else market.down_bid
-            self.logger.info("模拟监控: %s sell_bid=%.4f target=%.4f", direction, sell_bid, paper["take_profit"])
+            paper["current"] = sell_bid
+            paper["high"] = max(float(paper.get("high") or paper["entry"]), sell_bid)
+            row.update({
+                "current": paper["current"],
+                "high": paper["high"],
+            })
+            self.root.after(0, self.render_paper_results)
+            self.logger.info(
+                "模拟监控: %s sell_bid=%.4f high_bid=%.4f target=%.4f | up %.4f/%.4f down %.4f/%.4f",
+                direction,
+                sell_bid,
+                paper["high"],
+                paper["take_profit"],
+                market.up_bid,
+                market.up_ask,
+                market.down_bid,
+                market.down_ask,
+            )
             if sell_bid >= paper["take_profit"]:
                 paper["exit"] = sell_bid
                 paper["exit_reason"] = "TAKE_PROFIT"
@@ -1197,12 +1229,16 @@ class PolyQuickTrader:
             self.paper_tree.delete(item)
         for index, row in enumerate(self.paper_results):
             entry = row.get("entry")
+            current = row.get("current")
+            high = row.get("high")
             exit_price = row.get("exit")
             values = (
                 row.get("round", index + 1),
                 row.get("status", ""),
                 row.get("direction", ""),
                 "--" if entry is None else f"{float(entry):.4f}",
+                "--" if current is None else f"{float(current):.4f}",
+                "--" if high is None else f"{float(high):.4f}",
                 "--" if exit_price is None else f"{float(exit_price):.4f}",
                 f"{float(row.get('pnl', 0.0)):+.2f}",
                 f"{float(row.get('pnl_pct', 0.0)):+.2f}%",

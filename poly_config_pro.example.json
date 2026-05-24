@@ -5,7 +5,7 @@
     "quick_max_price": "0.60",
     "paper_usdc": "5",
     "paper_take_profit": "0.60",
-    "paper_poll_seconds": "10",
+    "paper_poll_seconds": "3",
     "paper_decision_lead_seconds": "120",
     "paper_rounds": "4",
     "paper_max_hours": "2"
