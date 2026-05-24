@@ -76,6 +76,7 @@ class PolyQuickTrader:
         self.latest_positions = []
         self.latest_signal = None
         self.paper_strategy_running = False
+        self.paper_strategy_stop_requested = threading.Event()
 
         self.logger = logging.getLogger("PolyQuickTrader")
         self.logger.setLevel(logging.INFO)
@@ -155,6 +156,8 @@ class PolyQuickTrader:
         self.btn_buy_down.pack(side="left", padx=4)
         self.btn_paper_strategy = ttk.Button(quick_ctrl_frame, text="模拟自动策略", width=16, command=self.paper_strategy_button_clicked)
         self.btn_paper_strategy.pack(side="left", padx=4)
+        self.btn_stop_paper_strategy = ttk.Button(quick_ctrl_frame, text="停止模拟", width=12, command=self.stop_paper_strategy_clicked, state="disabled")
+        self.btn_stop_paper_strategy.pack(side="left", padx=4)
 
         paper_frame = ttk.Frame(quick_frame)
         paper_frame.pack(fill="x", pady=(0, 8))
@@ -178,6 +181,14 @@ class PolyQuickTrader:
         self.ent_paper_decision_lead_seconds = ttk.Entry(paper_frame, width=7)
         self.ent_paper_decision_lead_seconds.insert(0, "120")
         self.ent_paper_decision_lead_seconds.pack(side="left", padx=4)
+        ttk.Label(paper_frame, text="模拟轮数:").pack(side="left", padx=(8, 4))
+        self.ent_paper_rounds = ttk.Entry(paper_frame, width=7)
+        self.ent_paper_rounds.insert(0, "4")
+        self.ent_paper_rounds.pack(side="left", padx=4)
+        ttk.Label(paper_frame, text="最多小时:").pack(side="left", padx=(8, 4))
+        self.ent_paper_max_hours = ttk.Entry(paper_frame, width=7)
+        self.ent_paper_max_hours.insert(0, "2")
+        self.ent_paper_max_hours.pack(side="left", padx=4)
 
         self.lbl_quick_signal = ttk.Label(quick_frame, text="只做辅助判断；每次真实下单前都会确认。", foreground="#475569")
         self.lbl_quick_signal.pack(fill="x", pady=(0, 8))
@@ -306,6 +317,8 @@ class PolyQuickTrader:
             "paper_min_prob": self.ent_paper_min_prob.get().strip(),
             "paper_poll_seconds": self.ent_paper_poll_seconds.get().strip(),
             "paper_decision_lead_seconds": self.ent_paper_decision_lead_seconds.get().strip(),
+            "paper_rounds": self.ent_paper_rounds.get().strip(),
+            "paper_max_hours": self.ent_paper_max_hours.get().strip(),
         }
 
     def save_config_to_local(self):
@@ -336,6 +349,8 @@ class PolyQuickTrader:
             self._set_entry(self.ent_paper_min_prob, config.get("paper_min_prob", "0.60"))
             self._set_entry(self.ent_paper_poll_seconds, config.get("paper_poll_seconds", "10"))
             self._set_entry(self.ent_paper_decision_lead_seconds, config.get("paper_decision_lead_seconds", "120"))
+            self._set_entry(self.ent_paper_rounds, config.get("paper_rounds", "4"))
+            self._set_entry(self.ent_paper_max_hours, config.get("paper_max_hours", "2"))
         except Exception as e:
             logging.error("加载配置文件失败: %s", e)
 
@@ -892,6 +907,8 @@ class PolyQuickTrader:
                 "min_prob": float(self.ent_paper_min_prob.get().strip()),
                 "poll_seconds": float(self.ent_paper_poll_seconds.get().strip()),
                 "decision_lead_seconds": float(self.ent_paper_decision_lead_seconds.get().strip()),
+                "rounds": int(float(self.ent_paper_rounds.get().strip())),
+                "max_hours": float(self.ent_paper_max_hours.get().strip()),
             }
         except ValueError:
             messagebox.showerror("参数错误", "模拟策略参数必须是数字。")
@@ -905,11 +922,21 @@ class PolyQuickTrader:
         if config["decision_lead_seconds"] < 0 or config["decision_lead_seconds"] > 600:
             messagebox.showerror("参数错误", "开盘前判断秒建议在 0 到 600 秒之间。")
             return
+        if config["rounds"] <= 0 or config["rounds"] > 500:
+            messagebox.showerror("参数错误", "模拟轮数必须在 1 到 500 之间。")
+            return
+        if config["max_hours"] <= 0 or config["max_hours"] > 168:
+            messagebox.showerror("参数错误", "最多小时必须在 0 到 168 之间。")
+            return
 
         self.paper_strategy_running = True
+        self.paper_strategy_stop_requested.clear()
         self.btn_paper_strategy.configure(state="disabled", text="模拟运行中")
+        self.btn_stop_paper_strategy.configure(state="normal")
         self.logger.info(
-            "启动模拟自动策略: 下一轮15m | max_entry=%.2f | take_profit=%.2f | min_prob=%.2f | lead=%.0fs",
+            "启动连续模拟策略: rounds=%s | max_hours=%.2f | next15m | max_entry=%.2f | take_profit=%.2f | min_prob=%.2f | lead=%.0fs",
+            config["rounds"],
+            config["max_hours"],
             config["max_entry"],
             config["take_profit"],
             config["min_prob"],
@@ -919,7 +946,7 @@ class PolyQuickTrader:
         def worker():
             loop = asyncio.new_event_loop()
             try:
-                result = loop.run_until_complete(self.run_paper_next_15m_strategy(config))
+                result = loop.run_until_complete(self.run_paper_strategy_series(config))
                 self.root.after(0, lambda result=result: self.logger.info("模拟策略结束: %s", result))
             except Exception as e:
                 error_text = str(e) or repr(e)
@@ -928,26 +955,65 @@ class PolyQuickTrader:
                 loop.close()
                 self.paper_strategy_running = False
                 self.root.after(0, lambda: self.btn_paper_strategy.configure(state="normal", text="模拟自动策略"))
+                self.root.after(0, lambda: self.btn_stop_paper_strategy.configure(state="disabled"))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    async def run_paper_next_15m_strategy(self, config):
+    def stop_paper_strategy_clicked(self):
+        if self.paper_strategy_running:
+            self.paper_strategy_stop_requested.set()
+            self.btn_stop_paper_strategy.configure(state="disabled")
+            self.logger.warning("已请求停止连续模拟；当前等待/轮询会尽快退出。")
+
+    async def run_paper_strategy_series(self, config):
+        started_at = time.time()
+        deadline = started_at + config["max_hours"] * 3600
+        results = []
+        seen_slugs = set()
+        for round_index in range(1, config["rounds"] + 1):
+            if self.paper_strategy_stop_requested.is_set():
+                break
+            if time.time() >= deadline:
+                self.logger.warning("连续模拟达到最多小时限制，停止。")
+                break
+            result = await self.run_paper_next_15m_strategy(config, round_index, seen_slugs, deadline)
+            results.append(result)
+            self.logger.info("连续模拟第 %s/%s 轮完成: %s", round_index, config["rounds"], result)
+            await self.sleep_with_stop(2)
+
+        summary = self.paper_series_summary(results)
+        await self.push_to_server_chan("Polymarket 连续模拟总结", summary)
+        return summary.replace("\n", " | ")
+
+    async def run_paper_next_15m_strategy(self, config, round_index=1, seen_slugs=None, deadline=None):
         market = await self.fetch_next_15m_market()
         if not market:
             raise RuntimeError("没有找到下一轮 15m 市场")
+        while seen_slugs is not None and market.slug in seen_slugs:
+            self.logger.info("已跑过 %s，等待下一轮 15m 市场。", market.slug)
+            await self.sleep_with_stop(5)
+            market = await self.fetch_next_15m_market()
+            if not market:
+                raise RuntimeError("没有找到下一轮 15m 市场")
+        if seen_slugs is not None:
+            seen_slugs.add(market.slug)
 
-        self.logger.info("模拟目标市场: %s | %s | end=%s", market.slug, market.question, market.end_dt)
+        self.logger.info("模拟第 %s 轮目标市场: %s | %s | end=%s", round_index, market.slug, market.question, market.end_dt)
         start_ts = self.market_start_timestamp(market)
         if start_ts:
             decision_ts = start_ts - config["decision_lead_seconds"]
             wait_seconds = decision_ts - time.time()
             if wait_seconds > 0:
+                if deadline and time.time() + wait_seconds > deadline:
+                    raise RuntimeError("达到最多小时限制，未进入下一轮判断窗口")
                 decision_time = datetime.fromtimestamp(decision_ts).astimezone().strftime("%H:%M:%S")
                 self.logger.info("模拟等待到开盘前 %.0f 秒再判断: 约 %s，等待 %.0f 秒", config["decision_lead_seconds"], decision_time, wait_seconds)
-                await asyncio.sleep(wait_seconds)
+                await self.sleep_with_stop(wait_seconds)
             else:
                 self.logger.info("当前已进入开盘前 %.0f 秒窗口，立即判断。", config["decision_lead_seconds"])
             market = await self.fetch_market_by_slug(market.slug) or market
+        if self.paper_strategy_stop_requested.is_set():
+            raise RuntimeError("用户停止模拟")
 
         signal = await self.fetch_btc_signal(market)
         minimax_key = self.ent_minimax_key.get().strip()
@@ -966,18 +1032,18 @@ class PolyQuickTrader:
         if action == "NO_TRADE" or not direction:
             result = f"NO_TRADE | {decision.get('reason', '')}"
             await self.push_paper_strategy_result("未入场", market, decision, None, result)
-            return result
+            return {"slug": market.slug, "status": "NO_TRADE", "result": result, "pnl": 0.0, "entered": False}
         if prob < config["min_prob"]:
             result = f"未入场: 概率 {prob:.2f} 低于阈值 {config['min_prob']:.2f}"
             await self.push_paper_strategy_result("未入场", market, decision, None, result)
-            return result
+            return {"slug": market.slug, "status": "NO_ENTRY", "result": result, "pnl": 0.0, "entered": False}
 
         market = await self.fetch_market_by_slug(market.slug) or market
         entry = market.up_ask if direction == "UP" else market.down_ask
         if entry > config["max_entry"]:
             result = f"未入场: {direction} ask={entry:.2f} 高于上限 {config['max_entry']:.2f}"
             await self.push_paper_strategy_result("未入场", market, decision, None, result)
-            return result
+            return {"slug": market.slug, "status": "NO_ENTRY", "result": result, "pnl": 0.0, "entered": False}
 
         paper = {
             "direction": direction,
@@ -995,7 +1061,9 @@ class PolyQuickTrader:
         if start_ts and time.time() < start_ts:
             wait_seconds = min(max(0, start_ts - time.time()), 1200)
             self.logger.info("模拟等待周期开始: %.0f 秒", wait_seconds)
-            await asyncio.sleep(wait_seconds)
+            await self.sleep_with_stop(wait_seconds)
+        if self.paper_strategy_stop_requested.is_set():
+            raise RuntimeError("用户停止模拟")
         paper["start_price"] = await self.fetch_latest_btc_price()
 
         while True:
@@ -1017,14 +1085,46 @@ class PolyQuickTrader:
                 paper["exit_reason"] = "SETTLED_WIN" if direction_wins else "SETTLED_LOSS"
                 paper["end_price"] = end_price
                 break
-            await asyncio.sleep(config["poll_seconds"])
+            if self.paper_strategy_stop_requested.is_set():
+                paper["exit"] = sell_bid
+                paper["exit_reason"] = "STOPPED"
+                break
+            await self.sleep_with_stop(config["poll_seconds"])
 
         pnl = (paper["exit"] - paper["entry"]) * paper["size"]
         paper["pnl"] = pnl
         paper["pnl_pct"] = pnl / paper["notional"] * 100
         result = f"{paper['exit_reason']} | {direction} entry={paper['entry']:.4f} exit={paper['exit']:.4f} pnl={pnl:+.2f} USDC ({paper['pnl_pct']:+.2f}%)"
         await self.push_paper_strategy_result("已结束", market, decision, paper, result)
-        return result
+        return {"slug": market.slug, "status": paper["exit_reason"], "result": result, "pnl": pnl, "entered": True}
+
+    async def sleep_with_stop(self, seconds):
+        end = time.time() + max(0, seconds)
+        while time.time() < end:
+            if self.paper_strategy_stop_requested.is_set():
+                return
+            await asyncio.sleep(min(1.0, end - time.time()))
+
+    def paper_series_summary(self, results):
+        entered = [r for r in results if r.get("entered")]
+        pnl = sum(float(r.get("pnl", 0.0)) for r in entered)
+        tp = sum(1 for r in entered if r.get("status") == "TAKE_PROFIT")
+        wins = sum(1 for r in entered if r.get("status") in {"TAKE_PROFIT", "SETTLED_WIN"})
+        lines = [
+            "### Polymarket 连续模拟总结",
+            "",
+            f"- 总轮数: `{len(results)}`",
+            f"- 入场轮数: `{len(entered)}`",
+            f"- 止盈次数: `{tp}`",
+            f"- 盈利/胜利次数: `{wins}`",
+            f"- 模拟总盈亏: `{pnl:+.2f}` USDC",
+        ]
+        if entered:
+            lines.append("")
+            lines.append("最近入场结果:")
+            for r in entered[-6:]:
+                lines.append(f"- `{r.get('status')}` | `{r.get('slug')}` | `{r.get('pnl', 0):+.2f}` USDC")
+        return "\n".join(lines)
 
     async def fetch_next_15m_market(self):
         now_ts = int(time.time())
