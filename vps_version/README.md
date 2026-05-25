@@ -1,12 +1,13 @@
 # Polymarket VPS Version
 
-这个版本和原来的 Tk 桌面版分开维护：VPS 跑 FastAPI 后端，本地浏览器打开前端看数据、跑回测、管理加密凭证。
+这个版本和原来的 Tk 桌面版分开维护：VPS 跑 FastAPI 后端，本地浏览器打开前端看数据、跑回测、管理加密凭证。VPS 版支持多用户，每个用户独立登录、独立密文凭证、独立策略任务。
 
 ## 安全模型
 
 - 私钥、CLOB key、Server 酱、MiniMax key 在浏览器里用密码加密。
-- VPS 磁盘只保存 `backend/data/encrypted_vault.json` 密文。
+- VPS 磁盘只保存 `backend/data/users.json` 的密码哈希，以及 `backend/data/users/<username>/encrypted_vault.json` 密文。
 - 点击“解锁”后，后端只把明文放在内存里；重启进程后需要重新解锁。
+- 用户密码只保存 PBKDF2-SHA256 哈希，不保存明文。
 - 生产使用建议通过 SSH tunnel、Tailscale 或 HTTPS 访问后端，不要裸奔公网端口。
 - 当前 VPS 版真实下单接口默认有安全闸门，只允许 dry-run。确认 dry-run 长时间稳定后，再接入真实交易执行。
 
@@ -44,6 +45,24 @@ ssh -L 8787:127.0.0.1:8787 user@your-vps
 http://127.0.0.1:8787
 ```
 
+## VPS 配置建议
+
+小团队只看数据、跑回测、dry-run：
+
+- 1 vCPU
+- 1 GB RAM
+- 10-20 GB SSD
+- Ubuntu 22.04/24.04
+
+多人长期在线、同时跑多个策略任务：
+
+- 2 vCPU
+- 2 GB RAM
+- 20-40 GB SSD
+- 建议加 1 GB swap
+
+如果后面接真实下单并多人同时用，建议至少 2 vCPU / 2 GB RAM，并用 SSH tunnel、Tailscale 或 Nginx HTTPS，不建议直接开放裸 HTTP 端口。
+
 ## 本地开发运行
 
 ```bash
@@ -55,6 +74,9 @@ cd vps_version
 
 ```bash
 curl http://127.0.0.1:8787/api/health
+curl -X POST http://127.0.0.1:8787/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"change-this-password"}'
 curl -X POST http://127.0.0.1:8787/api/strategy/capital \
   -H 'Content-Type: application/json' \
   -d '{"initial_usdc":5,"max_layers":3,"entry_price":0.5,"fee_rate":0.07}'

@@ -10,15 +10,19 @@
   <header>
     <div>
       <h1>Polymarket BTC 反转策略</h1>
-      <p>本地前端 + VPS 后端。敏感信息先在浏览器加密，再保存到 VPS。</p>
+      <p>多用户 VPS 后端。每个账号独立 vault、独立任务。</p>
     </div>
-    <label class="endpoint">后端地址 <input id="apiBase" value="http://127.0.0.1:8787"></label>
+    <div class="header-controls">
+      <label class="endpoint">后端地址 <input id="apiBase" value="http://127.0.0.1:8787"></label>
+      <span id="loginState">未登录</span>
+    </div>
   </header>
 
   <main>
     <nav>
       <button class="tab active" data-tab="dashboard">数据</button>
       <button class="tab" data-tab="backtest">回测</button>
+      <button class="tab" data-tab="account">账号</button>
       <button class="tab" data-tab="vault">凭证</button>
       <button class="tab" data-tab="live">任务</button>
     </nav>
@@ -33,6 +37,20 @@
         <thead><tr><th>周期</th><th>结束</th><th>Up</th><th>Down</th><th>量</th><th>市场</th></tr></thead>
         <tbody id="marketsBody"></tbody>
       </table>
+    </section>
+
+    <section id="account" class="panel">
+      <div class="form-grid">
+        <label>用户名 <input id="username" autocomplete="username"></label>
+        <label>密码 <input id="password" type="password" autocomplete="current-password"></label>
+      </div>
+      <div class="toolbar">
+        <button id="loginBtn">登录</button>
+        <button id="registerBtn">注册</button>
+        <button id="logoutBtn">退出</button>
+        <button id="meBtn">我的状态</button>
+      </div>
+      <pre id="accountBox"></pre>
     </section>
 
     <section id="backtest" class="panel">

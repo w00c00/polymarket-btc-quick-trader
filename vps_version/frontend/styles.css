@@ -68,6 +68,17 @@ label {
 .endpoint {
   min-width: 340px;
 }
+.header-controls {
+  align-items: end;
+  display: grid;
+  gap: 8px;
+  min-width: 360px;
+}
+#loginState {
+  color: #475569;
+  font-size: 13px;
+  text-align: right;
+}
 .panel {
   display: none;
 }

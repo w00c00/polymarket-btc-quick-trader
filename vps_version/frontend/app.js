@@ -13,10 +13,32 @@ function apiBase() {
   return $("apiBase").value.replace(/\/$/, "");
 }
 
+function authToken() {
+  return localStorage.getItem("poly_vps_token") || "";
+}
+
+function setAuth(token, username) {
+  if (token) {
+    localStorage.setItem("poly_vps_token", token);
+    localStorage.setItem("poly_vps_username", username);
+  } else {
+    localStorage.removeItem("poly_vps_token");
+    localStorage.removeItem("poly_vps_username");
+  }
+  updateLoginState();
+}
+
+function updateLoginState() {
+  const username = localStorage.getItem("poly_vps_username");
+  $("loginState").textContent = username ? `已登录: ${username}` : "未登录";
+}
+
 async function api(path, options = {}) {
+  const headers = {"Content-Type": "application/json", ...(options.headers || {})};
+  if (authToken()) headers.Authorization = `Bearer ${authToken()}`;
   const response = await fetch(`${apiBase()}${path}`, {
-    headers: {"Content-Type": "application/json"},
     ...options,
+    headers,
   });
   const text = await response.text();
   let data;
@@ -30,6 +52,8 @@ async function api(path, options = {}) {
   }
   return data;
 }
+
+updateLoginState();
 
 function show(id, value) {
   $(id).textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
@@ -47,6 +71,32 @@ function params(prefix = "") {
 
 $("healthBtn").onclick = async () => {
   try { show("healthBox", await api("/api/health")); } catch (e) { show("healthBox", e.message); }
+};
+
+$("loginBtn").onclick = async () => {
+  try {
+    const data = await api("/api/auth/login", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})});
+    setAuth(data.token, data.username);
+    show("accountBox", data);
+  } catch (e) { show("accountBox", e.message); }
+};
+
+$("registerBtn").onclick = async () => {
+  try {
+    const data = await api("/api/auth/register", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})});
+    setAuth(data.token, data.username);
+    show("accountBox", data);
+  } catch (e) { show("accountBox", e.message); }
+};
+
+$("logoutBtn").onclick = async () => {
+  try { await api("/api/auth/logout", {method: "POST"}); } catch {}
+  setAuth("", "");
+  show("accountBox", "已退出。");
+};
+
+$("meBtn").onclick = async () => {
+  try { show("accountBox", await api("/api/me")); } catch (e) { show("accountBox", e.message); }
 };
 
 $("scanBtn").onclick = async () => {
