@@ -50,6 +50,11 @@ button.tab.active {
   background: #111827;
   color: #ffffff;
 }
+button.secondary {
+  background: #ffffff;
+  border-color: #cbd5e1;
+  color: #111827;
+}
 input, select {
   border: 1px solid #cbd5e1;
   border-radius: 6px;
@@ -87,8 +92,28 @@ label {
 }
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin: 10px 0;
+}
+.status-line {
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  color: #334155;
+  font-size: 13px;
+  margin: 10px 0;
+  padding: 10px 12px;
+}
+.status-line.ok {
+  background: #ecfdf5;
+  border-color: #86efac;
+  color: #166534;
+}
+.status-line.warn {
+  background: #fffbeb;
+  border-color: #fcd34d;
+  color: #92400e;
 }
 .form-grid {
   display: grid;
@@ -118,6 +143,9 @@ th, td {
 }
 th {
   background: #f3f4f6;
+}
+tr.selected {
+  background: #eff6ff;
 }
 .notice {
   background: #ecfeff;

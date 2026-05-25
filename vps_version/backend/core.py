@@ -287,6 +287,82 @@ def kline_color(row):
     return "D"
 
 
+def rsi_from_closes(closes, period=14):
+    if len(closes) <= period:
+        return 50.0
+    gains = []
+    losses = []
+    for prev, curr in zip(closes[-period - 1:-1], closes[-period:]):
+        change = curr - prev
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def local_btc_probability_from_rows(rows, market=None):
+    if len(rows) < 40:
+        raise ValueError("K 线数量不足，无法预测。")
+    closes = [float(row[4]) for row in rows]
+    colors = [kline_color(row) for row in rows]
+    last = closes[-1]
+
+    ret_3 = closes[-1] / closes[-4] - 1.0
+    ret_8 = closes[-1] / closes[-9] - 1.0
+    ret_16 = closes[-1] / closes[-17] - 1.0
+    rsi = rsi_from_closes(closes)
+    recent_red = colors[-3:] == ["R", "R", "R"]
+    recent_green = colors[-3:] == ["G", "G", "G"]
+
+    score = 0.0
+    score += max(min(ret_3 * 1800.0, 0.16), -0.16)
+    score += max(min(ret_8 * 950.0, 0.16), -0.16)
+    score += max(min(ret_16 * 520.0, 0.14), -0.14)
+    score += max(min((rsi - 50.0) / 260.0, 0.11), -0.11)
+
+    reversal_hint = "无明显三连反转"
+    if recent_red:
+        score += 0.07
+        reversal_hint = "三连阴后偏反弹"
+    elif recent_green:
+        score -= 0.07
+        reversal_hint = "三连阳后偏回落"
+
+    up_probability = min(0.82, max(0.18, 0.5 + score))
+    down_probability = 1.0 - up_probability
+    confidence = min(0.86, max(0.28, abs(up_probability - 0.5) * 1.6 + 0.32))
+
+    if up_probability >= 0.56:
+        action = "BUY_UP"
+    elif down_probability >= 0.56:
+        action = "BUY_DOWN"
+    else:
+        action = "WAIT"
+
+    return {
+        "market": market or {},
+        "last_price": last,
+        "last_kline": fmt_kline_time(rows[-1]),
+        "up_probability": up_probability,
+        "down_probability": down_probability,
+        "confidence": confidence,
+        "action": action,
+        "signals": {
+            "ret_45m": ret_3,
+            "ret_120m": ret_8,
+            "ret_240m": ret_16,
+            "rsi14": rsi,
+            "last3": "".join(colors[-3:]),
+            "reversal_hint": reversal_hint,
+        },
+        "note": "本地轻量模型，仅用于快速筛选；实盘前仍要结合盘口、流动性和结算时间。",
+    }
+
+
 def fmt_kline_time(row):
     return datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
 

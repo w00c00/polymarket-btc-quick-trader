@@ -31,10 +31,12 @@
       <div class="toolbar">
         <button id="healthBtn">连接测试</button>
         <button id="scanBtn">扫描短周期市场</button>
+        <button id="predictBtn">预测选中市场</button>
       </div>
+      <div id="selectedMarketBox" class="status-line">未选择市场</div>
       <pre id="healthBox"></pre>
       <table>
-        <thead><tr><th>周期</th><th>结束</th><th>Up</th><th>Down</th><th>量</th><th>市场</th></tr></thead>
+        <thead><tr><th>选择</th><th>周期</th><th>结束</th><th>Up</th><th>Down</th><th>量</th><th>市场</th></tr></thead>
         <tbody id="marketsBody"></tbody>
       </table>
     </section>
@@ -50,6 +52,7 @@
         <button id="logoutBtn">退出</button>
         <button id="meBtn">我的状态</button>
       </div>
+      <div id="accountStatus" class="status-line">未登录</div>
       <pre id="accountBox"></pre>
     </section>
 

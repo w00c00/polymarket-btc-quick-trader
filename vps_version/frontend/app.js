@@ -1,4 +1,6 @@
 const $ = (id) => document.getElementById(id);
+let markets = [];
+let selectedMarket = null;
 
 for (const btn of document.querySelectorAll(".tab")) {
   btn.addEventListener("click", () => {
@@ -35,6 +37,10 @@ function setAuth(token, username) {
 function updateLoginState() {
   const username = localStorage.getItem("poly_vps_username");
   $("loginState").textContent = username ? `已登录: ${username}` : "未登录";
+  if ($("accountStatus")) {
+    $("accountStatus").textContent = username ? `当前已登录账号：${username}` : "未登录";
+    $("accountStatus").className = username ? "status-line ok" : "status-line warn";
+  }
 }
 
 async function api(path, options = {}) {
@@ -63,6 +69,28 @@ function show(id, value) {
   $(id).textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
 }
 
+function formatPct(value) {
+  return `${(Number(value || 0) * 100).toFixed(1)}%`;
+}
+
+function formatPrice(value) {
+  return Number(value || 0).toFixed(2);
+}
+
+function setSelectedMarket(index) {
+  selectedMarket = markets[index] || null;
+  document.querySelectorAll("#marketsBody tr").forEach((row) => row.classList.remove("selected"));
+  const row = document.querySelector(`#marketsBody tr[data-index="${index}"]`);
+  if (row) row.classList.add("selected");
+  if (!selectedMarket) {
+    $("selectedMarketBox").textContent = "未选择市场";
+    $("selectedMarketBox").className = "status-line warn";
+    return;
+  }
+  $("selectedMarketBox").textContent = `已选择：${selectedMarket.period} | ${selectedMarket.question} | Up ${formatPrice(selectedMarket.up_bid)}/${formatPrice(selectedMarket.up_ask)} Down ${formatPrice(selectedMarket.down_bid)}/${formatPrice(selectedMarket.down_ask)}`;
+  $("selectedMarketBox").className = "status-line ok";
+}
+
 function params(prefix = "") {
   return {
     mode: $(`${prefix}mode`)?.value || $("mode").value,
@@ -81,7 +109,7 @@ $("loginBtn").onclick = async () => {
   try {
     const data = await api("/api/auth/login", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})});
     setAuth(data.token, data.username);
-    show("accountBox", data);
+    show("accountBox", {ok: true, message: "登录成功", username: data.username});
   } catch (e) { show("accountBox", e.message); }
 };
 
@@ -89,7 +117,7 @@ $("registerBtn").onclick = async () => {
   try {
     const data = await api("/api/auth/register", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})});
     setAuth(data.token, data.username);
-    show("accountBox", data);
+    show("accountBox", {ok: true, message: "注册并登录成功", username: data.username});
   } catch (e) { show("accountBox", e.message); }
 };
 
@@ -104,18 +132,51 @@ $("meBtn").onclick = async () => {
 };
 
 $("scanBtn").onclick = async () => {
-  $("marketsBody").innerHTML = "<tr><td colspan='6'>扫描中...</td></tr>";
+  $("marketsBody").innerHTML = "<tr><td colspan='7'>扫描中...</td></tr>";
   try {
     const data = await api("/api/markets/quick");
+    markets = data.items || [];
+    selectedMarket = null;
     $("marketsBody").innerHTML = "";
-    for (const m of data.items) {
+    $("selectedMarketBox").textContent = markets.length ? "请选择一个短周期市场后再预测。" : "未扫描到短周期市场。";
+    $("selectedMarketBox").className = markets.length ? "status-line warn" : "status-line";
+    for (const [index, m] of markets.entries()) {
       const row = document.createElement("tr");
-      row.innerHTML = `<td>${m.period}</td><td>${m.end_dt || "--"}</td><td>${m.up_bid.toFixed(2)}/${m.up_ask.toFixed(2)}</td><td>${m.down_bid.toFixed(2)}/${m.down_ask.toFixed(2)}</td><td>${Math.round(m.volume24h)}</td><td>${m.question}</td>`;
+      row.dataset.index = String(index);
+      row.innerHTML = `<td><button class="secondary" data-select="${index}">选择</button></td><td>${m.period}</td><td>${m.end_dt || "--"}</td><td>${formatPrice(m.up_bid)}/${formatPrice(m.up_ask)}</td><td>${formatPrice(m.down_bid)}/${formatPrice(m.down_ask)}</td><td>${Math.round(m.volume24h)}</td><td>${m.question}</td>`;
+      row.addEventListener("click", (event) => {
+        if (event.target?.tagName === "BUTTON" || event.target?.tagName === "TD") {
+          setSelectedMarket(index);
+        }
+      });
       $("marketsBody").appendChild(row);
     }
+    if (markets.length) setSelectedMarket(0);
   } catch (e) {
-    $("marketsBody").innerHTML = `<tr><td colspan='6'>${e.message}</td></tr>`;
+    $("marketsBody").innerHTML = `<tr><td colspan='7'>${e.message}</td></tr>`;
   }
+};
+
+$("predictBtn").onclick = async () => {
+  if (!selectedMarket) {
+    show("healthBox", "请先扫描并选择一个短周期市场。");
+    return;
+  }
+  try {
+    show("healthBox", "预测中...");
+    const data = await api("/api/strategy/predict", {method: "POST", body: JSON.stringify({market: selectedMarket, days: 3})});
+    show("healthBox", {
+      market: `${selectedMarket.period} ${selectedMarket.question}`,
+      action: data.action,
+      up_probability: formatPct(data.up_probability),
+      down_probability: formatPct(data.down_probability),
+      confidence: formatPct(data.confidence),
+      last_price: Number(data.last_price.toFixed(2)),
+      last_kline: data.last_kline,
+      signals: data.signals,
+      note: data.note,
+    });
+  } catch (e) { show("healthBox", e.message); }
 };
 
 $("capitalBtn").onclick = async () => {

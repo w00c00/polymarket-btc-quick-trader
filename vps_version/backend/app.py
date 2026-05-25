@@ -12,6 +12,7 @@ from core import (
     MarketData,
     REVERSAL_MODE_GREEN_DOWN,
     REVERSAL_MODE_RED_UP,
+    local_btc_probability_from_rows,
     reversal_stakes,
     run_reversal_backtest_from_rows,
 )
@@ -64,6 +65,11 @@ class CapitalRequest(BaseModel):
 class BacktestRequest(CapitalRequest):
     mode: str = REVERSAL_MODE_RED_UP
     days: int = Field(ge=1, le=1000, default=365)
+
+
+class PredictRequest(BaseModel):
+    market: dict = Field(default_factory=dict)
+    days: int = Field(ge=1, le=14, default=3)
 
 
 class LiveStartRequest(CapitalRequest):
@@ -165,6 +171,15 @@ async def lock_vault(username: str = Depends(current_user)):
 async def quick_markets():
     try:
         return {"items": await market_data.fetch_quick_btc_markets()}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/strategy/predict")
+async def strategy_predict(req: PredictRequest):
+    try:
+        rows = await market_data.fetch_btc_15m_klines(req.days)
+        return local_btc_probability_from_rows(rows, req.market)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
