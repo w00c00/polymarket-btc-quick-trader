@@ -63,7 +63,17 @@ class UnlockRequest(BaseModel):
 
 class AuthRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=6)
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
     password: str = Field(min_length=10)
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str = Field(min_length=1)
+    new_password: str = Field(min_length=6)
 
 
 class CapitalRequest(BaseModel):
@@ -115,6 +125,13 @@ class NotificationSettings(BaseModel):
     daily_report_time: str = Field(default="21:30", pattern=r"^\d{2}:\d{2}$")
 
 
+class ModelSettings(BaseModel):
+    preferred_provider: str = "minimax_cn"
+    preferred_model: str = "MiniMax-M2.7"
+    custom_base_url: str = ""
+    custom_model: str = ""
+
+
 def validate_mode(mode: str):
     if mode not in {REVERSAL_MODE_RED_UP, REVERSAL_MODE_GREEN_DOWN}:
         raise HTTPException(status_code=400, detail="未知策略模式")
@@ -130,8 +147,20 @@ def current_user(authorization: str | None = Header(default=None)):
 
 
 def admin_user(username: str = Depends(current_user)):
-    if not user_store.is_admin(username):
+    user = user_store.public_user(username)
+    if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="需要管理员权限。")
+    if user.get("password_change_required"):
+        raise HTTPException(status_code=403, detail="管理员首次登录必须先修改默认密码。")
+    return username
+
+
+def regular_user(username: str = Depends(current_user)):
+    user = user_store.public_user(username)
+    if user.get("role") == "admin":
+        raise HTTPException(status_code=403, detail="管理员账号只用于后台管理，不能进行交易或保存交易凭证。")
+    if user.get("password_change_required"):
+        raise HTTPException(status_code=403, detail="请先修改初始密码。")
     return username
 
 
@@ -344,17 +373,23 @@ async def index():
     return FileResponse(FRONTEND_DIR / "index.html")
 
 
+@app.get("/admin")
+async def admin_index():
+    return FileResponse(FRONTEND_DIR / "admin.html")
+
+
 @app.get("/api/health")
 async def health():
     return {"ok": True, "users": len(user_store.users)}
 
 
 @app.post("/api/auth/register")
-async def register(req: AuthRequest):
+async def register(req: RegisterRequest):
     try:
         user_store.register(req.username, req.password)
         token = user_store.login(req.username, req.password)
-        return {"ok": True, "token": token, "username": req.username}
+        user = user_store.public_user(req.username)
+        return {"ok": True, "token": token, **user}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -363,7 +398,8 @@ async def register(req: AuthRequest):
 async def login(req: AuthRequest):
     try:
         token = user_store.login(req.username, req.password)
-        return {"ok": True, "token": token, "username": req.username}
+        user = user_store.public_user(req.username)
+        return {"ok": True, "token": token, **user}
     except Exception as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
@@ -375,11 +411,22 @@ async def logout(authorization: str | None = Header(default=None)):
     return {"ok": True}
 
 
+@app.post("/api/auth/change_password")
+async def change_password(req: ChangePasswordRequest, username: str = Depends(current_user)):
+    try:
+        user_store.change_password(username, req.old_password, req.new_password)
+        return {"ok": True, **user_store.public_user(username)}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/me")
 async def me(username: str = Depends(current_user)):
+    user = user_store.public_user(username)
     return {
         "username": username,
-        "role": "admin" if user_store.is_admin(username) else "user",
+        "role": user["role"],
+        "password_change_required": user["password_change_required"],
         "vault": vault.status(username),
         "jobs": user_jobs(username),
         "settings": user_store.settings(username),
@@ -419,25 +466,38 @@ async def admin_jobs(_: str = Depends(admin_user)):
 
 
 @app.post("/api/settings/notifications")
-async def save_notification_settings(req: NotificationSettings, username: str = Depends(current_user)):
+async def save_notification_settings(req: NotificationSettings, username: str = Depends(regular_user)):
     settings = user_store.update_settings(username, req.model_dump())
     return {"ok": True, "settings": settings}
 
 
 @app.get("/api/settings/notifications")
-async def get_notification_settings(username: str = Depends(current_user)):
+async def get_notification_settings(username: str = Depends(regular_user)):
     settings = {"telegram_bot_token": "", "telegram_chat_id": "", "daily_report_time": "21:30"}
     settings.update(user_store.settings(username))
     return settings
 
 
+@app.post("/api/settings/model")
+async def save_model_settings(req: ModelSettings, username: str = Depends(regular_user)):
+    settings = user_store.update_settings(username, {"model": req.model_dump()})
+    return {"ok": True, "model": settings.get("model") or {}}
+
+
+@app.get("/api/settings/model")
+async def get_model_settings(username: str = Depends(regular_user)):
+    model = {"preferred_provider": "minimax_cn", "preferred_model": "MiniMax-M2.7", "custom_base_url": "", "custom_model": ""}
+    model.update((user_store.settings(username).get("model") or {}))
+    return model
+
+
 @app.get("/api/vault/status")
-async def vault_status(username: str = Depends(current_user)):
+async def vault_status(username: str = Depends(regular_user)):
     return vault.status(username)
 
 
 @app.post("/api/vault/save")
-async def save_vault(blob: VaultBlob, username: str = Depends(current_user)):
+async def save_vault(blob: VaultBlob, username: str = Depends(regular_user)):
     try:
         vault.save_encrypted_blob(blob.model_dump(), username)
         vault.lock(username)
@@ -447,7 +507,7 @@ async def save_vault(blob: VaultBlob, username: str = Depends(current_user)):
 
 
 @app.post("/api/vault/unlock")
-async def unlock_vault(req: UnlockRequest, username: str = Depends(current_user)):
+async def unlock_vault(req: UnlockRequest, username: str = Depends(regular_user)):
     try:
         loaded = vault.unlock(req.passphrase, username)
         return {"ok": True, "loaded": loaded, "status": vault.status(username)}
@@ -456,7 +516,7 @@ async def unlock_vault(req: UnlockRequest, username: str = Depends(current_user)
 
 
 @app.post("/api/vault/lock")
-async def lock_vault(username: str = Depends(current_user)):
+async def lock_vault(username: str = Depends(regular_user)):
     vault.lock(username)
     return {"ok": True, "status": vault.status(username)}
 
@@ -470,7 +530,7 @@ async def quick_markets():
 
 
 @app.get("/api/trading/snapshot")
-async def trading_snapshot(username: str = Depends(current_user)):
+async def trading_snapshot(username: str = Depends(regular_user)):
     if not vault.status(username)["unlocked"]:
         raise HTTPException(status_code=400, detail="请先解锁凭证。")
     try:
@@ -488,7 +548,7 @@ async def trading_snapshot(username: str = Depends(current_user)):
 
 
 @app.post("/api/trading/manual_order")
-async def manual_order(req: ManualOrderRequest, username: str = Depends(current_user)):
+async def manual_order(req: ManualOrderRequest, username: str = Depends(regular_user)):
     if not vault.status(username)["unlocked"]:
         raise HTTPException(status_code=400, detail="请先解锁凭证。")
     try:
@@ -539,7 +599,7 @@ async def manual_order(req: ManualOrderRequest, username: str = Depends(current_
 
 
 @app.post("/api/trading/sell_position")
-async def sell_position(req: PositionSellRequest, username: str = Depends(current_user)):
+async def sell_position(req: PositionSellRequest, username: str = Depends(regular_user)):
     if not vault.status(username)["unlocked"]:
         raise HTTPException(status_code=400, detail="请先解锁凭证。")
     try:
@@ -567,7 +627,7 @@ async def sell_position(req: PositionSellRequest, username: str = Depends(curren
 
 
 @app.post("/api/reports/send_now")
-async def send_report_now(username: str = Depends(current_user)):
+async def send_report_now(username: str = Depends(regular_user)):
     try:
         content = await build_account_report(username)
         if not content:
@@ -620,7 +680,7 @@ async def dry_run_live_job(job_id: str, config: dict):
 
 
 @app.post("/api/strategy/live/start")
-async def live_start(req: LiveStartRequest, username: str = Depends(current_user)):
+async def live_start(req: LiveStartRequest, username: str = Depends(regular_user)):
     validate_mode(req.mode)
     if not req.dry_run and not vault.status(username)["unlocked"]:
         raise HTTPException(status_code=400, detail="实盘需要先解锁加密凭证。")
@@ -646,7 +706,7 @@ async def live_start(req: LiveStartRequest, username: str = Depends(current_user
 
 
 @app.post("/api/strategy/live/stop")
-async def live_stop(mode: str | None = None, username: str = Depends(current_user)):
+async def live_stop(mode: str | None = None, username: str = Depends(regular_user)):
     stopped = []
     for job_id, job in user_jobs(username).items():
         if mode and job.get("mode") != mode:
@@ -658,5 +718,5 @@ async def live_stop(mode: str | None = None, username: str = Depends(current_use
 
 
 @app.get("/api/strategy/live/status")
-async def live_status(username: str = Depends(current_user)):
+async def live_status(username: str = Depends(regular_user)):
     return {"jobs": user_jobs(username)}

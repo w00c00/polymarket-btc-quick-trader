@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Polymarket 管理后台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Polymarket 管理后台</h1>
+      <p>只做用户、缓存和任务状态管理，不提供交易功能。</p>
+    </div>
+    <div class="header-controls">
+      <label class="endpoint">后端地址 <input id="apiBase" value=""></label>
+      <span id="loginState">未登录</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel active">
+      <div class="notice">默认管理员账号为 poly，默认密码为 123456。首次登录后必须修改密码，才能使用后台管理功能。</div>
+      <div class="form-grid">
+        <label>管理员账号 <input id="username" value="poly" autocomplete="username"></label>
+        <label>密码 <input id="password" type="password" autocomplete="current-password"></label>
+        <label>旧密码 <input id="oldPassword" type="password" autocomplete="current-password"></label>
+        <label>新密码 <input id="newPassword" type="password" autocomplete="new-password"></label>
+      </div>
+      <div class="toolbar">
+        <button id="loginBtn">登录后台</button>
+        <button id="changePasswordBtn">修改管理员密码</button>
+        <button id="logoutBtn">退出</button>
+        <button id="meBtn">状态</button>
+      </div>
+      <pre id="accountBox"></pre>
+    </section>
+
+    <section class="panel active">
+      <div class="toolbar">
+        <button id="adminUsersBtn">刷新用户</button>
+        <button id="adminJobsBtn">查看任务</button>
+        <button id="clearCacheBtn">清理缓存</button>
+      </div>
+      <table>
+        <thead><tr><th>用户</th><th>角色</th><th>强制改密</th><th>创建时间</th><th>报告时间</th><th>操作</th></tr></thead>
+        <tbody id="adminUsersBody"></tbody>
+      </table>
+      <pre id="adminBox"></pre>
+    </section>
+  </main>
+
+  <script src="/static/admin.js"></script>
+</body>
+</html>

@@ -33,6 +33,16 @@ function setAuth(token, username) {
   updateLoginState();
 }
 
+function afterLogin(data) {
+  setAuth(data.token, data.username);
+  if (data.role === "admin") {
+    show("accountBox", "管理员账号只用于独立后台，请打开 /admin。");
+  }
+  if (data.password_change_required) {
+    show("accountBox", "该账号必须先修改初始密码。请在下方填写旧密码和新密码。");
+  }
+}
+
 function updateLoginState() {
   const username = localStorage.getItem("poly_vps_username");
   $("loginState").textContent = username ? `已登录: ${username}` : "未登录";
@@ -206,6 +216,14 @@ function credentialPayload() {
     passphrase: $("apiPassphrase").value,
     sendkey: $("serverChan").value,
     minimax_key: $("minimax").value,
+    openai_key: $("openaiKey").value,
+    anthropic_key: $("anthropicKey").value,
+    google_key: $("googleKey").value,
+    deepseek_key: $("deepseekKey").value,
+    qwen_key: $("qwenKey").value,
+    kimi_key: $("kimiKey").value,
+    zhipu_key: $("zhipuKey").value,
+    openrouter_key: $("openrouterKey").value,
   };
 }
 
@@ -221,23 +239,6 @@ async function encryptedVaultBlob() {
   return {version: 1, kdf: "PBKDF2-SHA256", iterations, salt: bytesToB64(salt), nonce: bytesToB64(nonce), ciphertext: bytesToB64(ciphertext)};
 }
 
-async function loadAdminUsers() {
-  const data = await api("/api/admin/users");
-  $("adminUsersBody").innerHTML = "";
-  for (const user of data.users || []) {
-    const row = document.createElement("tr");
-    row.innerHTML = `<td>${user.username}</td><td>${user.role}</td><td>${user.created_at || "--"}</td><td>${user.settings?.daily_report_time || "--"}</td><td><button class="secondary" data-del="${user.username}">删除</button></td>`;
-    $("adminUsersBody").appendChild(row);
-  }
-  document.querySelectorAll("[data-del]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      if (!window.confirm(`确认删除用户 ${btn.dataset.del}？`)) return;
-      show("adminBox", await api(`/api/admin/users/${encodeURIComponent(btn.dataset.del)}`, {method: "DELETE"}));
-      await loadAdminUsers();
-    });
-  });
-}
-
 updateLoginState();
 
 $("healthBtn").onclick = async () => { try { show("manualBox", await api("/api/health")); } catch (e) { show("manualBox", e.message); } };
@@ -247,10 +248,11 @@ $("snapshotBtn").onclick = async () => { try { await refreshSnapshot(); } catch 
 $("buyUpBtn").onclick = async () => { try { await submitManual("UP"); } catch (e) { show("manualBox", e.message); } };
 $("buyDownBtn").onclick = async () => { try { await submitManual("DOWN"); } catch (e) { show("manualBox", e.message); } };
 
-$("loginBtn").onclick = async () => { try { const data = await api("/api/auth/login", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})}); setAuth(data.token, data.username); show("accountBox", {ok: true, message: "登录成功", username: data.username}); } catch (e) { show("accountBox", e.message); } };
-$("registerBtn").onclick = async () => { try { const data = await api("/api/auth/register", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})}); setAuth(data.token, data.username); show("accountBox", {ok: true, message: "注册并登录成功", username: data.username}); } catch (e) { show("accountBox", e.message); } };
+$("loginBtn").onclick = async () => { try { const data = await api("/api/auth/login", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})}); afterLogin(data); show("accountBox", {ok: true, message: "登录成功", username: data.username, role: data.role, password_change_required: data.password_change_required}); } catch (e) { show("accountBox", e.message); } };
+$("registerBtn").onclick = async () => { try { const data = await api("/api/auth/register", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})}); afterLogin(data); show("accountBox", {ok: true, message: "注册并登录成功", username: data.username, role: data.role}); } catch (e) { show("accountBox", e.message); } };
 $("logoutBtn").onclick = async () => { try { await api("/api/auth/logout", {method: "POST"}); } catch {} setAuth("", ""); show("accountBox", "已退出。"); };
 $("meBtn").onclick = async () => { try { show("accountBox", await api("/api/me")); } catch (e) { show("accountBox", e.message); } };
+$("changePasswordBtn").onclick = async () => { try { show("accountBox", await api("/api/auth/change_password", {method: "POST", body: JSON.stringify({old_password: $("oldPassword").value, new_password: $("newPassword").value})})); } catch (e) { show("accountBox", e.message); } };
 
 $("capitalBtn").onclick = async () => { try { const data = await api("/api/strategy/capital", {method: "POST", body: JSON.stringify(params(""))}); show("capitalBox", {stakes: data.stakes.map((x) => Number(x.toFixed(2))), stake_sum: Number(data.stake_sum.toFixed(2)), worst_loss: Number(data.worst_loss.toFixed(2)), recommended_single_strategy_usdc: data.recommended_single_strategy_usdc, recommended_both_strategies_usdc: data.recommended_both_strategies_usdc}); } catch (e) { show("capitalBox", e.message); } };
 $("backtestBtn").onclick = async () => { try { const body = {...params(""), days: Number($("days").value)}; const data = await api("/api/strategy/backtest", {method: "POST", body: JSON.stringify(body)}); show("backtestBox", {label: data.label, range: `${data.from} -> ${data.to}`, cycles: data.cycles, wins: data.wins, losses: data.losses, win_rate: `${(data.win_rate * 100).toFixed(2)}%`, total_pnl: Number(data.total_pnl.toFixed(2)), max_drawdown: Number(data.max_drawdown.toFixed(2)), recent: data.recent}); } catch (e) { show("backtestBox", e.message); } };
@@ -269,9 +271,8 @@ $("loadNotifyBtn").onclick = async () => { try { const data = await api("/api/se
 $("saveNotifyBtn").onclick = async () => { try { show("notifyBox", await api("/api/settings/notifications", {method: "POST", body: JSON.stringify({telegram_bot_token: $("telegramToken").value, telegram_chat_id: $("telegramChat").value, daily_report_time: $("dailyReportTime").value || "21:30"})})); } catch (e) { show("notifyBox", e.message); } };
 $("sendReportBtn").onclick = async () => { try { show("notifyBox", await api("/api/reports/send_now", {method: "POST"})); } catch (e) { show("notifyBox", e.message); } };
 
-$("adminUsersBtn").onclick = async () => { try { await loadAdminUsers(); } catch (e) { show("adminBox", e.message); } };
-$("adminJobsBtn").onclick = async () => { try { show("adminBox", await api("/api/admin/jobs")); } catch (e) { show("adminBox", e.message); } };
-$("clearCacheBtn").onclick = async () => { try { show("adminBox", await api("/api/admin/cache/clear", {method: "POST"})); } catch (e) { show("adminBox", e.message); } };
+$("loadModelBtn").onclick = async () => { try { const data = await api("/api/settings/model"); $("preferredProvider").value = data.preferred_provider || "minimax_cn"; $("preferredModel").value = data.preferred_model || "MiniMax-M2.7"; $("customBaseUrl").value = data.custom_base_url || ""; $("customModel").value = data.custom_model || ""; show("modelBox", data); } catch (e) { show("modelBox", e.message); } };
+$("saveModelBtn").onclick = async () => { try { show("modelBox", await api("/api/settings/model", {method: "POST", body: JSON.stringify({preferred_provider: $("preferredProvider").value, preferred_model: $("preferredModel").value, custom_base_url: $("customBaseUrl").value, custom_model: $("customModel").value})})); } catch (e) { show("modelBox", e.message); } };
 
 setInterval(() => {
   if (authToken() && document.getElementById("manual").classList.contains("active")) {

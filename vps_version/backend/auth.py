@@ -11,6 +11,8 @@ from pathlib import Path
 
 DEFAULT_USERS_PATH = Path(os.environ.get("POLY_VPS_USERS_PATH", "data/users.json"))
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{3,32}$")
+DEFAULT_ADMIN_USERNAME = "poly"
+DEFAULT_ADMIN_PASSWORD = "123456"
 
 
 def b64(value: bytes) -> str:
@@ -44,6 +46,7 @@ class UserStore:
         self.path = path
         self.sessions = {}
         self.users = self._load()
+        self._ensure_default_admin()
 
     def _load(self):
         if not self.path.exists():
@@ -57,6 +60,27 @@ class UserStore:
         os.chmod(tmp_path, 0o600)
         tmp_path.replace(self.path)
 
+    def _ensure_default_admin(self):
+        changed = False
+        for username, user in self.users.items():
+            if username != DEFAULT_ADMIN_USERNAME and user.get("role") == "admin":
+                user["role"] = "user"
+                user.setdefault("password_change_required", False)
+                changed = True
+        user = self.users.get(DEFAULT_ADMIN_USERNAME)
+        if user and user.get("role") == "admin":
+            if changed:
+                self._save()
+            return
+        self.users[DEFAULT_ADMIN_USERNAME] = {
+            "password": password_hash(DEFAULT_ADMIN_PASSWORD),
+            "created_at": int(time.time()),
+            "role": "admin",
+            "settings": {},
+            "password_change_required": True,
+        }
+        self._save()
+
     def register(self, username: str, password: str):
         username = username.strip()
         if not USERNAME_PATTERN.match(username):
@@ -68,8 +92,9 @@ class UserStore:
         self.users[username] = {
             "password": password_hash(password),
             "created_at": int(time.time()),
-            "role": "admin" if not self.users else "user",
+            "role": "user",
             "settings": {},
+            "password_change_required": False,
         }
         self._save()
 
@@ -84,6 +109,26 @@ class UserStore:
         }
         return token
 
+    def public_user(self, username: str):
+        user = self.users.get(username) or {}
+        return {
+            "username": username,
+            "role": user.get("role", "user"),
+            "created_at": user.get("created_at"),
+            "settings": user.get("settings") or {},
+            "password_change_required": bool(user.get("password_change_required")),
+        }
+
+    def change_password(self, username: str, old_password: str, new_password: str):
+        user = self.users.get(username)
+        if not user or not verify_password(old_password, user.get("password") or {}):
+            raise ValueError("旧密码错误。")
+        if len(new_password) < 6:
+            raise ValueError("新密码至少 6 位。")
+        user["password"] = password_hash(new_password)
+        user["password_change_required"] = False
+        self._save()
+
     def logout(self, token: str):
         self.sessions.pop(token, None)
 
@@ -96,15 +141,7 @@ class UserStore:
         return session["username"]
 
     def list_users(self):
-        return [
-            {
-                "username": username,
-                "role": user.get("role", "user"),
-                "created_at": user.get("created_at"),
-                "settings": user.get("settings") or {},
-            }
-            for username, user in sorted(self.users.items())
-        ]
+        return [self.public_user(username) for username in sorted(self.users)]
 
     def is_admin(self, username: str):
         return (self.users.get(username) or {}).get("role") == "admin"

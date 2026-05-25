@@ -12,8 +12,20 @@ def test_register_login_and_session(tmp_path):
     store.register("alice", "very-secret-password")
     token = store.login("alice", "very-secret-password")
     assert store.user_for_token(token) == "alice"
+    assert store.public_user("alice")["role"] == "user"
     store.logout(token)
     assert store.user_for_token(token) is None
+
+
+def test_default_admin_requires_password_change(tmp_path):
+    store = UserStore(tmp_path / "users.json")
+    token = store.login("poly", "123456")
+    assert store.user_for_token(token) == "poly"
+    admin = store.public_user("poly")
+    assert admin["role"] == "admin"
+    assert admin["password_change_required"] is True
+    store.change_password("poly", "123456", "abcdef")
+    assert store.public_user("poly")["password_change_required"] is False
 
 
 def test_reject_duplicate_user(tmp_path):

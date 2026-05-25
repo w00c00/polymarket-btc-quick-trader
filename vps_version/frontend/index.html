@@ -24,9 +24,9 @@
       <button class="tab" data-tab="strategy">策略任务</button>
       <button class="tab" data-tab="backtest">回测</button>
       <button class="tab" data-tab="vault">凭证</button>
+      <button class="tab" data-tab="models">模型</button>
       <button class="tab" data-tab="notify">通知报告</button>
       <button class="tab" data-tab="account">账号</button>
-      <button class="tab" data-tab="admin">管理员</button>
     </nav>
 
     <section id="manual" class="panel active">
@@ -118,6 +118,14 @@
         <label>Passphrase <input id="apiPassphrase" type="password" autocomplete="off"></label>
         <label>Server 酱 SendKey <input id="serverChan" type="password" autocomplete="off"></label>
         <label>MiniMax Key <input id="minimax" type="password" autocomplete="off"></label>
+        <label>OpenAI Key <input id="openaiKey" type="password" autocomplete="off"></label>
+        <label>Anthropic Key <input id="anthropicKey" type="password" autocomplete="off"></label>
+        <label>Google Gemini Key <input id="googleKey" type="password" autocomplete="off"></label>
+        <label>DeepSeek Key <input id="deepseekKey" type="password" autocomplete="off"></label>
+        <label>阿里 Qwen Key <input id="qwenKey" type="password" autocomplete="off"></label>
+        <label>Kimi Key <input id="kimiKey" type="password" autocomplete="off"></label>
+        <label>智谱 GLM Key <input id="zhipuKey" type="password" autocomplete="off"></label>
+        <label>OpenRouter Key <input id="openrouterKey" type="password" autocomplete="off"></label>
         <label>本地加密密码 <input id="vaultPassword" type="password" autocomplete="new-password"></label>
       </div>
       <div class="toolbar">
@@ -127,6 +135,34 @@
         <button id="vaultStatusBtn">状态</button>
       </div>
       <pre id="vaultBox"></pre>
+    </section>
+
+    <section id="models" class="panel">
+      <div class="notice">模型 API Key 保存在“凭证”页的加密 vault 里。这里保存默认调用顺序和自定义模型信息；默认首选 MiniMax 国内版。</div>
+      <div class="form-grid">
+        <label>首选模型服务
+          <select id="preferredProvider">
+            <option value="minimax_cn">MiniMax 国内版</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="qwen">阿里 Qwen</option>
+            <option value="kimi">Kimi</option>
+            <option value="zhipu">智谱 GLM</option>
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic Claude</option>
+            <option value="google">Google Gemini</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="custom">自定义 OpenAI 兼容接口</option>
+          </select>
+        </label>
+        <label>首选模型名 <input id="preferredModel" value="MiniMax-M2.7"></label>
+        <label>自定义 Base URL <input id="customBaseUrl" placeholder="https://.../v1"></label>
+        <label>自定义模型名 <input id="customModel"></label>
+      </div>
+      <div class="toolbar">
+        <button id="loadModelBtn">读取模型配置</button>
+        <button id="saveModelBtn">保存模型配置</button>
+      </div>
+      <pre id="modelBox"></pre>
     </section>
 
     <section id="notify" class="panel">
@@ -149,29 +185,20 @@
       <div class="form-grid">
         <label>用户名 <input id="username" autocomplete="username"></label>
         <label>密码 <input id="password" type="password" autocomplete="current-password"></label>
+        <label>旧密码 <input id="oldPassword" type="password" autocomplete="current-password"></label>
+        <label>新密码 <input id="newPassword" type="password" autocomplete="new-password"></label>
       </div>
       <div class="toolbar">
         <button id="loginBtn">登录</button>
         <button id="registerBtn">注册</button>
         <button id="logoutBtn">退出</button>
         <button id="meBtn">我的状态</button>
+        <button id="changePasswordBtn">修改密码</button>
       </div>
       <div id="accountStatus" class="status-line">未登录</div>
       <pre id="accountBox"></pre>
     </section>
 
-    <section id="admin" class="panel">
-      <div class="toolbar">
-        <button id="adminUsersBtn">刷新用户</button>
-        <button id="adminJobsBtn">查看任务</button>
-        <button id="clearCacheBtn">清理缓存</button>
-      </div>
-      <table>
-        <thead><tr><th>用户</th><th>角色</th><th>创建时间</th><th>报告时间</th><th>操作</th></tr></thead>
-        <tbody id="adminUsersBody"></tbody>
-      </table>
-      <pre id="adminBox"></pre>
-    </section>
   </main>
 
   <script src="/static/app.js"></script>
