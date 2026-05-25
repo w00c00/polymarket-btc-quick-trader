@@ -1895,16 +1895,12 @@ class PolyQuickTrader:
         if size < 5.0:
             raise RuntimeError(f"买入金额太小，按价格 {price:.4f} 至少需要 {price * 5:.2f} USDC 才满足 5 份最小下单量")
         self.logger.info("提交买入订单: %s price=%.4f size=%.4f tick=%s", direction, price, size, tick_size or market.tick_size)
-        resp = await asyncio.wait_for(
-            asyncio.to_thread(
-                client.create_and_post_order,
-                order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.BUY),
-                options=PartialCreateOrderOptions(tick_size=tick_size or market.tick_size),
-                order_type=OrderType.GTC,
-                post_only=False,
-            ),
-            timeout=25,
+        signed = await asyncio.to_thread(
+            client.create_order,
+            order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.BUY),
+            options=PartialCreateOrderOptions(tick_size=tick_size or market.tick_size),
         )
+        resp = await self._post_signed_order_with_retry(client, signed, order_type=OrderType.GTC, post_only=False)
         if isinstance(resp, dict) and resp.get("success") is False:
             raise RuntimeError(f"交易所拒绝订单: {resp}")
         fill = self._extract_fill(resp, limit_price=price, limit_size=size)
@@ -1952,16 +1948,12 @@ class PolyQuickTrader:
         client = self.build_client(config, creds)
         price = self.clamp_price(price, tick_size)
         self.logger.warning("提交实盘自动卖出订单: token=%s price=%.4f size=%.4f tick=%s", token_id[:12], price, size, tick_size)
-        resp = await asyncio.wait_for(
-            asyncio.to_thread(
-                client.create_and_post_order,
-                order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.SELL),
-                options=PartialCreateOrderOptions(tick_size=tick_size),
-                order_type=OrderType.GTC,
-                post_only=False,
-            ),
-            timeout=25,
+        signed = await asyncio.to_thread(
+            client.create_order,
+            order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.SELL),
+            options=PartialCreateOrderOptions(tick_size=tick_size),
         )
+        resp = await self._post_signed_order_with_retry(client, signed, order_type=OrderType.GTC, post_only=False)
         if isinstance(resp, dict) and resp.get("success") is False:
             raise RuntimeError(f"交易所拒绝卖出订单: {resp}")
         return resp
@@ -2062,6 +2054,52 @@ class PolyQuickTrader:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 1.5, 60.0)
         return "pending_timeout"
+
+    async def _post_signed_order_with_retry(
+        self,
+        client,
+        signed_order,
+        order_type=OrderType.GTC,
+        post_only: bool = False,
+        max_attempts: int = 2,
+        per_attempt_timeout: float = 25.0,
+    ):
+        """
+        Post a pre-signed CLOB order with retry-safe semantics.
+
+        Per Phase 2 research (cycles/_phase2-research.md): SignedOrderV2 is
+        byte-level frozen (salt + timestamp + EIP-712 signature all set in
+        create_order). Re-posting the same instance produces byte-identical
+        request bodies → identical orderID (order hash) → server dedup.
+        py_clob_client_v2's own retry_on_error path uses this assumption.
+
+        On per-attempt TimeoutError we retry the SAME signed_order. If all
+        attempts time out, raise a RuntimeError indicating user should
+        reconcile at polymarket.com/portfolio (the order may have landed).
+
+        WARNING: server-side dedup is inferred, not OpenAPI-documented.
+        Phase 2 commit MUST be followed by a live spike (see handoff).
+        """
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(client.post_order, signed_order, order_type, post_only),
+                    timeout=per_attempt_timeout,
+                )
+                if attempt > 1:
+                    self.logger.info("post_order 重试 attempt=%s 成功", attempt)
+                return resp
+            except asyncio.TimeoutError as e:
+                last_exc = e
+                self.logger.warning(
+                    "post_order 超时 attempt=%s/%s — 用同一 signed_order 重试 (server 应按 orderID 去重)",
+                    attempt, max_attempts,
+                )
+                continue
+        raise RuntimeError(
+            f"post_order 重试 {max_attempts} 次仍超时；订单可能已成交，请去 polymarket.com/portfolio 对账"
+        ) from last_exc
 
     @staticmethod
     def _append_trade_journal(row: dict, path: str = "trade_journal.csv"):
@@ -2188,16 +2226,12 @@ class PolyQuickTrader:
         tick_size = str(position.get("orderPriceMinTickSize") or "0.01")
         price = self.clamp_price(price, tick_size)
         self.logger.info("提交卖出订单: %s price=%.4f size=%.4f tick=%s", token_id[:12], price, size, tick_size)
-        resp = await asyncio.wait_for(
-            asyncio.to_thread(
-                client.create_and_post_order,
-                order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.SELL),
-                options=PartialCreateOrderOptions(tick_size=tick_size),
-                order_type=OrderType.GTC,
-                post_only=False,
-            ),
-            timeout=25,
+        signed = await asyncio.to_thread(
+            client.create_order,
+            order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.SELL),
+            options=PartialCreateOrderOptions(tick_size=tick_size),
         )
+        resp = await self._post_signed_order_with_retry(client, signed, order_type=OrderType.GTC, post_only=False)
         if isinstance(resp, dict) and resp.get("success") is False:
             raise RuntimeError(f"交易所拒绝订单: {resp}")
         await self.push_trade_result(
