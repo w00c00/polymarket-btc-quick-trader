@@ -13,30 +13,56 @@
 
 ## VPS 部署
 
+推荐正式部署路径：
+
+- 程序目录：`/opt/polymarket-vps`
+- 数据目录：`/var/lib/polymarket-vps`
+- systemd 服务：`polymarket-vps`
+- 运行用户：`polymm`
+
+这个方案不依赖任何临时 sudo 用户的 home 目录。你可以用 `root` 登录，也可以用有 sudo 权限的普通用户登录；部署完成后，服务由系统用户 `polymm` 跑。
+
+### 从本机一键部署到 VPS
+
 ```bash
-cd ~/polymarket-btc-quick-trader/vps_version
+cd vps_version
+./deploy/deploy_remote.sh root@your-vps-ip
+```
+
+如果 SSH 端口不是 22：
+
+```bash
+./deploy/deploy_remote.sh ubuntu@your-vps-ip 2222
+```
+
+脚本会把当前 `vps_version` 打包上传到 VPS 的 `/tmp`，然后在 VPS 上安装到 `/opt/polymarket-vps`，数据落到 `/var/lib/polymarket-vps`。
+
+### 在 VPS 上本地安装
+
+```bash
+cd /tmp/polymarket-vps-deploy
 ./deploy/install_vps.sh
 ```
 
 安装脚本会：
 
-- 创建 `.venv`
+- 创建或更新 `/opt/polymarket-vps`
+- 创建 `/opt/polymarket-vps/.venv`
 - 安装 `backend/requirements.txt`
-- 生成 systemd service 模板到 `deploy/polymarket-vps.service.generated`
-
-按你的路径检查 service 后：
-
-```bash
-sudo cp deploy/polymarket-vps.service.generated /etc/systemd/system/polymarket-vps.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now polymarket-vps
-sudo systemctl status polymarket-vps
-```
+- 创建系统用户 `polymm`
+- 创建数据目录 `/var/lib/polymarket-vps`
+- 写入并启动 systemd 服务
 
 默认监听 `127.0.0.1:8787`。如果本地连 VPS，推荐 SSH 隧道：
 
 ```bash
 ssh -L 8787:127.0.0.1:8787 user@your-vps
+```
+
+或者：
+
+```bash
+./deploy/ssh_tunnel.sh user@your-vps
 ```
 
 然后本地浏览器打开：
@@ -62,6 +88,20 @@ http://127.0.0.1:8787
 - 建议加 1 GB swap
 
 如果后面接真实下单并多人同时用，建议至少 2 vCPU / 2 GB RAM，并用 SSH tunnel、Tailscale 或 Nginx HTTPS，不建议直接开放裸 HTTP 端口。
+
+## 运维命令
+
+```bash
+sudo systemctl status polymarket-vps
+sudo journalctl -u polymarket-vps -f
+sudo systemctl restart polymarket-vps
+```
+
+备份用户和加密凭证：
+
+```bash
+sudo tar -czf polymarket-vps-data-backup.tgz -C /var/lib polymarket-vps
+```
 
 ## 本地开发运行
 
