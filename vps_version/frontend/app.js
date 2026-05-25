@@ -9,6 +9,10 @@ for (const btn of document.querySelectorAll(".tab")) {
   });
 }
 
+if ($("apiBase") && !$("apiBase").value) {
+  $("apiBase").value = window.location.origin;
+}
+
 function apiBase() {
   return $("apiBase").value.replace(/\/$/, "");
 }
