@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Polymarket VPS 控制台</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Polymarket BTC 反转策略</h1>
+      <p>本地前端 + VPS 后端。敏感信息先在浏览器加密，再保存到 VPS。</p>
+    </div>
+    <label class="endpoint">后端地址 <input id="apiBase" value="http://127.0.0.1:8787"></label>
+  </header>
+
+  <main>
+    <nav>
+      <button class="tab active" data-tab="dashboard">数据</button>
+      <button class="tab" data-tab="backtest">回测</button>
+      <button class="tab" data-tab="vault">凭证</button>
+      <button class="tab" data-tab="live">任务</button>
+    </nav>
+
+    <section id="dashboard" class="panel active">
+      <div class="toolbar">
+        <button id="healthBtn">连接测试</button>
+        <button id="scanBtn">扫描短周期市场</button>
+      </div>
+      <pre id="healthBox"></pre>
+      <table>
+        <thead><tr><th>周期</th><th>结束</th><th>Up</th><th>Down</th><th>量</th><th>市场</th></tr></thead>
+        <tbody id="marketsBody"></tbody>
+      </table>
+    </section>
+
+    <section id="backtest" class="panel">
+      <div class="form-grid">
+        <label>策略
+          <select id="mode">
+            <option>三连阴转UP</option>
+            <option>三连阳转DOWN</option>
+          </select>
+        </label>
+        <label>首单U <input id="initial" type="number" value="5" step="0.1"></label>
+        <label>最多单数 <input id="layers" type="number" value="3" min="1" max="10"></label>
+        <label>入场价 <input id="entry" type="number" value="0.50" step="0.01"></label>
+        <label>回测天数 <input id="days" type="number" value="365"></label>
+      </div>
+      <div class="toolbar">
+        <button id="capitalBtn">计算本金</button>
+        <button id="backtestBtn">运行回测</button>
+      </div>
+      <pre id="capitalBox"></pre>
+      <pre id="backtestBox"></pre>
+    </section>
+
+    <section id="vault" class="panel">
+      <div class="notice">加密在当前浏览器完成。VPS 磁盘只保存密文；解锁后凭证只放在后端内存。</div>
+      <div class="form-grid">
+        <label>Polygon 私钥 <input id="privKey" type="password" autocomplete="off"></label>
+        <label>Funder 地址 <input id="funder" autocomplete="off"></label>
+        <label>签名类型 <input id="signatureType" value="3"></label>
+        <label>CLOB API Key <input id="apiKey" autocomplete="off"></label>
+        <label>CLOB Secret <input id="apiSecret" type="password" autocomplete="off"></label>
+        <label>Passphrase <input id="apiPassphrase" type="password" autocomplete="off"></label>
+        <label>Server 酱 SendKey <input id="serverChan" type="password" autocomplete="off"></label>
+        <label>MiniMax Key <input id="minimax" type="password" autocomplete="off"></label>
+        <label>本地加密密码 <input id="vaultPassword" type="password" autocomplete="new-password"></label>
+      </div>
+      <div class="toolbar">
+        <button id="saveVaultBtn">加密保存到 VPS</button>
+        <button id="unlockVaultBtn">解锁到 VPS 内存</button>
+        <button id="lockVaultBtn">锁定</button>
+        <button id="vaultStatusBtn">状态</button>
+      </div>
+      <pre id="vaultBox"></pre>
+    </section>
+
+    <section id="live" class="panel">
+      <div class="form-grid">
+        <label>策略
+          <select id="liveMode">
+            <option>三连阴转UP</option>
+            <option>三连阳转DOWN</option>
+          </select>
+        </label>
+        <label>首单U <input id="liveInitial" type="number" value="5" step="0.1"></label>
+        <label>最多单数 <input id="liveLayers" type="number" value="3" min="1" max="10"></label>
+        <label>最高入场价 <input id="liveEntry" type="number" value="0.50" step="0.01"></label>
+        <label>最多小时 <input id="liveHours" type="number" value="24" step="1"></label>
+      </div>
+      <div class="toolbar">
+        <button id="startDryRunBtn">启动 dry-run</button>
+        <button id="stopLiveBtn">停止</button>
+        <button id="liveStatusBtn">刷新状态</button>
+      </div>
+      <pre id="liveBox"></pre>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>
