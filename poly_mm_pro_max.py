@@ -86,6 +86,8 @@ class PolyQuickTrader:
         self.live_auto_enabled = False
         self.live_auto_running = False
         self.live_auto_stop_requested = threading.Event()
+        self.reversal_running = False
+        self.reversal_stop_requested = threading.Event()
         self.log_context = threading.local()
 
         self.logger = logging.getLogger("PolyQuickTrader")
@@ -243,6 +245,35 @@ class PolyQuickTrader:
         self.btn_overnight_paper.pack(side="left", padx=(10, 4))
         self.btn_stop_paper_strategy = ttk.Button(paper_row2, text="停止模拟", width=12, command=self.stop_paper_strategy_clicked, state="disabled")
         self.btn_stop_paper_strategy.pack(side="left", padx=4)
+
+        reversal_frame = ttk.LabelFrame(auto_tab, text=" 三连阴反弹 UP 策略研究 ", padding=10)
+        reversal_frame.pack(fill="x", padx=0, pady=5)
+        reversal_row1 = ttk.Frame(reversal_frame)
+        reversal_row1.pack(fill="x", pady=(0, 4))
+        reversal_row2 = ttk.Frame(reversal_frame)
+        reversal_row2.pack(fill="x")
+        ttk.Label(reversal_row1, text="首单U:").pack(side="left", padx=(4, 4))
+        self.ent_reversal_usdc = ttk.Entry(reversal_row1, width=7)
+        self.ent_reversal_usdc.insert(0, "5")
+        self.ent_reversal_usdc.pack(side="left", padx=4)
+        ttk.Label(reversal_row1, text="最多单数:").pack(side="left", padx=(8, 4))
+        self.ent_reversal_layers = ttk.Entry(reversal_row1, width=7)
+        self.ent_reversal_layers.insert(0, "3")
+        self.ent_reversal_layers.pack(side="left", padx=4)
+        ttk.Label(reversal_row1, text="回测天数:").pack(side="left", padx=(8, 4))
+        self.ent_reversal_days = ttk.Entry(reversal_row1, width=7)
+        self.ent_reversal_days.insert(0, "365")
+        self.ent_reversal_days.pack(side="left", padx=4)
+        ttk.Label(reversal_row1, text="入场价:").pack(side="left", padx=(8, 4))
+        self.ent_reversal_entry = ttk.Entry(reversal_row1, width=7)
+        self.ent_reversal_entry.insert(0, "0.50")
+        self.ent_reversal_entry.pack(side="left", padx=4)
+        self.btn_reversal_backtest = ttk.Button(reversal_row2, text="三连阴回测", width=16, command=self.reversal_backtest_button_clicked)
+        self.btn_reversal_backtest.pack(side="left", padx=4)
+        self.btn_reversal_live = ttk.Button(reversal_row2, text="三连阴实时模拟", width=18, command=self.reversal_live_button_clicked)
+        self.btn_reversal_live.pack(side="left", padx=4)
+        self.btn_stop_reversal = ttk.Button(reversal_row2, text="停止三连阴模拟", width=18, command=self.stop_reversal_clicked, state="disabled")
+        self.btn_stop_reversal.pack(side="left", padx=4)
 
         self.lbl_quick_signal = ttk.Label(quick_frame, text="只做辅助判断；每次真实下单前都会确认。", foreground="#475569")
         self.lbl_quick_signal.pack(fill="x", pady=(0, 8))
@@ -542,6 +573,10 @@ class PolyQuickTrader:
             "paper_decision_lead_seconds": self.ent_paper_decision_lead_seconds.get().strip(),
             "paper_rounds": self.ent_paper_rounds.get().strip(),
             "paper_max_hours": self.ent_paper_max_hours.get().strip(),
+            "reversal_usdc": self.ent_reversal_usdc.get().strip(),
+            "reversal_layers": self.ent_reversal_layers.get().strip(),
+            "reversal_days": self.ent_reversal_days.get().strip(),
+            "reversal_entry": self.ent_reversal_entry.get().strip(),
             "live_usdc": self.ent_live_usdc.get().strip(),
             "live_take_profit": self.ent_live_take_profit.get().strip(),
             "live_poll_seconds": self.ent_live_poll_seconds.get().strip(),
@@ -579,6 +614,10 @@ class PolyQuickTrader:
             self._set_entry(self.ent_paper_decision_lead_seconds, config.get("paper_decision_lead_seconds", "120"))
             self._set_entry(self.ent_paper_rounds, config.get("paper_rounds", "40"))
             self._set_entry(self.ent_paper_max_hours, config.get("paper_max_hours", "12"))
+            self._set_entry(self.ent_reversal_usdc, config.get("reversal_usdc", "5"))
+            self._set_entry(self.ent_reversal_layers, config.get("reversal_layers", "3"))
+            self._set_entry(self.ent_reversal_days, config.get("reversal_days", "365"))
+            self._set_entry(self.ent_reversal_entry, config.get("reversal_entry", "0.50"))
             self._set_entry(self.ent_live_usdc, config.get("live_usdc", "5"))
             self._set_entry(self.ent_live_take_profit, config.get("live_take_profit", "0.60"))
             self._set_entry(self.ent_live_poll_seconds, config.get("live_poll_seconds", "3"))
@@ -1208,6 +1247,333 @@ class PolyQuickTrader:
             self.paper_strategy_stop_requested.set()
             self.btn_stop_paper_strategy.configure(state="disabled")
             self.log_auto(logging.WARNING, "已请求停止连续模拟；当前等待/轮询会尽快退出。")
+
+    def reversal_config_from_ui(self):
+        try:
+            config = {
+                "initial_usdc": float(self.ent_reversal_usdc.get().strip()),
+                "max_layers": int(float(self.ent_reversal_layers.get().strip())),
+                "days": int(float(self.ent_reversal_days.get().strip())),
+                "entry_price": float(self.ent_reversal_entry.get().strip()),
+                "fee_rate": 0.07,
+            }
+        except ValueError:
+            messagebox.showerror("参数错误", "三连阴策略参数必须是数字。")
+            return None
+        if config["initial_usdc"] <= 0:
+            messagebox.showerror("参数错误", "首单U必须大于 0。")
+            return None
+        if config["max_layers"] <= 0 or config["max_layers"] > 10:
+            messagebox.showerror("参数错误", "最多单数建议在 1 到 10 之间。")
+            return None
+        if config["days"] <= 0 or config["days"] > 1000:
+            messagebox.showerror("参数错误", "回测天数必须在 1 到 1000 之间。")
+            return None
+        if not (0 < config["entry_price"] < 1):
+            messagebox.showerror("参数错误", "入场价必须在 0 到 1 之间。")
+            return None
+        return config
+
+    def reversal_backtest_button_clicked(self):
+        config = self.reversal_config_from_ui()
+        if not config:
+            return
+        self.btn_reversal_backtest.configure(state="disabled")
+        self.log_auto(
+            logging.INFO,
+            "开始三连阴回测: days=%s initial=%.2f layers=%s entry=%.2f",
+            config["days"],
+            config["initial_usdc"],
+            config["max_layers"],
+            config["entry_price"],
+        )
+
+        def worker():
+            self.set_log_category("auto")
+            loop = asyncio.new_event_loop()
+            try:
+                result = loop.run_until_complete(self.run_reversal_backtest(config))
+                self.root.after(0, lambda result=result: self.log_auto(logging.INFO, "%s", result))
+            except Exception as e:
+                error_text = str(e) or repr(e)
+                self.root.after(0, lambda err=error_text: self.log_auto(logging.ERROR, "三连阴回测失败: %s", err))
+            finally:
+                loop.close()
+                self.root.after(0, lambda: self.btn_reversal_backtest.configure(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def reversal_live_button_clicked(self):
+        if self.reversal_running:
+            messagebox.showinfo("三连阴实时模拟", "三连阴实时模拟正在运行中。")
+            return
+        config = self.reversal_config_from_ui()
+        if not config:
+            return
+        self.reversal_running = True
+        self.reversal_stop_requested.clear()
+        self.btn_reversal_live.configure(state="disabled", text="三连阴模拟中")
+        self.btn_stop_reversal.configure(state="normal")
+        self.log_auto(
+            logging.INFO,
+            "启动三连阴实时模拟: initial=%.2f layers=%s entry=%.2f",
+            config["initial_usdc"],
+            config["max_layers"],
+            config["entry_price"],
+        )
+
+        def worker():
+            self.set_log_category("auto")
+            loop = asyncio.new_event_loop()
+            try:
+                result = loop.run_until_complete(self.run_reversal_live_sim(config))
+                self.root.after(0, lambda result=result: self.log_auto(logging.INFO, "三连阴实时模拟结束: %s", result))
+            except Exception as e:
+                error_text = str(e) or repr(e)
+                self.root.after(0, lambda err=error_text: self.log_auto(logging.ERROR, "三连阴实时模拟失败: %s", err))
+            finally:
+                loop.close()
+                self.reversal_running = False
+                self.root.after(0, lambda: self.btn_reversal_live.configure(state="normal", text="三连阴实时模拟"))
+                self.root.after(0, lambda: self.btn_stop_reversal.configure(state="disabled"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def stop_reversal_clicked(self):
+        if self.reversal_running:
+            self.reversal_stop_requested.set()
+            self.btn_stop_reversal.configure(state="disabled")
+            self.log_auto(logging.WARNING, "已请求停止三连阴实时模拟。")
+
+    def reversal_factors(self, entry_price: float, fee_rate: float = 0.07):
+        win_factor = 1.0 / entry_price - 1.0 - fee_rate * (1.0 - entry_price)
+        loss_factor = 1.0 + fee_rate * (1.0 - entry_price)
+        return win_factor, loss_factor
+
+    def reversal_stakes(self, initial_usdc: float, entry_price: float, max_layers: int, fee_rate: float = 0.07):
+        win_factor, loss_factor = self.reversal_factors(entry_price, fee_rate)
+        target_profit = win_factor * initial_usdc
+        stakes = []
+        accumulated_loss = 0.0
+        for _ in range(max_layers):
+            stake = (accumulated_loss + target_profit) / win_factor
+            stakes.append(stake)
+            accumulated_loss += loss_factor * stake
+        return stakes, win_factor, loss_factor, target_profit
+
+    def kline_color(self, row):
+        open_price = float(row[1])
+        close_price = float(row[4])
+        if close_price < open_price:
+            return "R"
+        if close_price > open_price:
+            return "G"
+        return "D"
+
+    def fmt_kline_time(self, row):
+        return datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+
+    async def fetch_btc_15m_klines(self, days=7, limit=1000):
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - int(days * 24 * 3600 * 1000)
+        rows = []
+        current = start_ms
+        urls = ["https://api.binance.com/api/v3/klines", "https://data-api.binance.vision/api/v3/klines"]
+        while current < end_ms:
+            params = {
+                "symbol": "BTCUSDT",
+                "interval": "15m",
+                "startTime": str(current),
+                "endTime": str(end_ms),
+                "limit": str(limit),
+            }
+            data = None
+            last_error = None
+            for url in urls:
+                try:
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                        async with session.get(url, params=params) as response:
+                            if response.status != 200:
+                                raise RuntimeError(f"Binance kline HTTP {response.status}")
+                            data = await response.json()
+                            break
+                except Exception as e:
+                    last_error = e
+            if data is None:
+                raise RuntimeError(f"读取 Binance 15m K 线失败: {last_error}")
+            if not data:
+                break
+            rows.extend(data)
+            next_start = int(data[-1][0]) + 15 * 60 * 1000
+            if next_start <= current:
+                break
+            current = next_start
+            await asyncio.sleep(0.02)
+
+        now_ms = int(time.time() * 1000)
+        deduped = {}
+        for row in rows:
+            if int(row[6]) <= now_ms:
+                deduped[int(row[0])] = row
+        return [deduped[key] for key in sorted(deduped)]
+
+    async def run_reversal_backtest(self, config):
+        rows = await self.fetch_btc_15m_klines(config["days"])
+        if len(rows) < 10:
+            raise RuntimeError("K 线数量不足，无法回测。")
+        colors = [self.kline_color(row) for row in rows]
+        stakes, win_factor, loss_factor, target_profit = self.reversal_stakes(
+            config["initial_usdc"],
+            config["entry_price"],
+            config["max_layers"],
+            config["fee_rate"],
+        )
+        cycles = []
+        i = 2
+        while i < len(colors) - 1:
+            is_new_three_red = colors[i - 2:i + 1] == ["R", "R", "R"] and (i < 3 or colors[i - 3] != "R")
+            if not is_new_three_red:
+                i += 1
+                continue
+            trigger_index = i
+            pnl = None
+            rows_used = []
+            last_trade_index = trigger_index
+            for layer, stake in enumerate(stakes, start=1):
+                trade_index = trigger_index + layer
+                if trade_index >= len(colors):
+                    break
+                last_trade_index = trade_index
+                win = colors[trade_index] == "G"
+                rows_used.append({
+                    "layer": layer,
+                    "time": self.fmt_kline_time(rows[trade_index]),
+                    "stake": stake,
+                    "win": win,
+                    "color": colors[trade_index],
+                })
+                if win:
+                    pnl = target_profit
+                    break
+            if pnl is None and len(rows_used) == len(stakes):
+                pnl = -sum(loss_factor * stake for stake in stakes[:len(rows_used)])
+            elif pnl is None:
+                break
+            cycles.append({
+                "trigger": self.fmt_kline_time(rows[trigger_index]),
+                "pnl": pnl,
+                "win": pnl > 0,
+                "layers": len(rows_used),
+                "rows": rows_used,
+            })
+            i = last_trade_index + 1
+            while i < len(colors) and colors[i] == "R":
+                i += 1
+
+        total_pnl = sum(item["pnl"] for item in cycles)
+        wins = sum(1 for item in cycles if item["win"])
+        losses = len(cycles) - wins
+        equity = 0.0
+        peak = 0.0
+        max_drawdown = 0.0
+        for item in cycles:
+            equity += item["pnl"]
+            peak = max(peak, equity)
+            max_drawdown = min(max_drawdown, equity - peak)
+        full_loss = -sum(loss_factor * stake for stake in stakes)
+        lines = [
+            "三连阴反弹 UP 回测完成",
+            f"区间: {self.fmt_kline_time(rows[0])} 到 {self.fmt_kline_time(rows[-1])}",
+            f"K线数: {len(rows)} | 触发周期: {len(cycles)} | 胜: {wins} | 败: {losses} | 胜率: {(wins / len(cycles) * 100 if cycles else 0):.2f}%",
+            f"首单: {config['initial_usdc']:.2f}U | 入场价: {config['entry_price']:.2f} | 最多单数: {config['max_layers']}",
+            f"下注序列: {' -> '.join(f'{x:.2f}' for x in stakes)}",
+            f"单周期赢目标: +{target_profit:.2f}U | 单周期全亏: {full_loss:.2f}U",
+            f"总盈亏: {total_pnl:+.2f}U | 最大回撤: {max_drawdown:.2f}U",
+        ]
+        if cycles:
+            lines.append("最近5次触发:")
+            for item in cycles[-5:]:
+                lines.append(f"- {item['trigger']} | {'WIN' if item['win'] else 'LOSS'} | layers={item['layers']} | pnl={item['pnl']:+.2f}U")
+        return "\n".join(lines)
+
+    async def run_reversal_live_sim(self, config):
+        stakes, win_factor, loss_factor, target_profit = self.reversal_stakes(
+            config["initial_usdc"],
+            config["entry_price"],
+            config["max_layers"],
+            config["fee_rate"],
+        )
+        self.log_auto(logging.INFO, "三连阴下注序列: %s", " -> ".join(f"{x:.2f}" for x in stakes))
+        seen_triggers = set()
+        cycle_count = 0
+        while not self.reversal_stop_requested.is_set():
+            rows = await self.fetch_btc_15m_klines(3)
+            if len(rows) < 6:
+                await self.sleep_with_stop(60, self.reversal_stop_requested)
+                continue
+            colors = [self.kline_color(row) for row in rows]
+            i = len(rows) - 1
+            trigger_found = colors[i - 2:i + 1] == ["R", "R", "R"] and (i < 3 or colors[i - 3] != "R")
+            trigger_key = int(rows[i][0])
+            if not trigger_found or trigger_key in seen_triggers:
+                red_streak = 0
+                for color in reversed(colors):
+                    if color == "R":
+                        red_streak += 1
+                    else:
+                        break
+                self.log_auto(logging.INFO, "三连阴实时等待中: 当前连续阴线=%s | 最新K线=%s", red_streak, self.fmt_kline_time(rows[-1]))
+                await self.sleep_with_stop(60, self.reversal_stop_requested)
+                continue
+            seen_triggers.add(trigger_key)
+            cycle_count += 1
+            self.log_auto(logging.INFO, "触发三连阴实时模拟 #%s: 第3根=%s", cycle_count, self.fmt_kline_time(rows[i]))
+            accumulated_loss = 0.0
+            cycle_done = False
+            for layer, stake in enumerate(stakes, start=1):
+                trade_open = trigger_key + layer * 15 * 60 * 1000
+                while not self.reversal_stop_requested.is_set():
+                    recent = await self.fetch_btc_15m_klines(3)
+                    trade_rows = [row for row in recent if int(row[0]) == trade_open]
+                    if trade_rows:
+                        trade_row = trade_rows[0]
+                        break
+                    wait_until = datetime.fromtimestamp((trade_open + 15 * 60 * 1000) / 1000, tz=timezone.utc).astimezone().strftime("%H:%M:%S")
+                    self.log_auto(logging.INFO, "等待第 %s 单结算: 约 %s", layer, wait_until)
+                    await self.sleep_with_stop(60, self.reversal_stop_requested)
+                if self.reversal_stop_requested.is_set():
+                    break
+                win = self.kline_color(trade_row) == "G"
+                if win:
+                    pnl = accumulated_loss + target_profit
+                    status = "REVERSAL_WIN"
+                    cycle_done = True
+                else:
+                    loss = loss_factor * stake
+                    accumulated_loss += loss
+                    pnl = -loss
+                    status = "REVERSAL_LOSS" if layer == len(stakes) else "REVERSAL_NEXT"
+                row = {
+                    "round": f"R{cycle_count}-{layer}",
+                    "slug": f"BTCUSDT 15m {self.fmt_kline_time(trade_row)}",
+                    "status": status,
+                    "direction": "UP",
+                    "entry": config["entry_price"],
+                    "current": 1.0 if win else 0.0,
+                    "high": 1.0 if win else 0.0,
+                    "exit": 1.0 if win else 0.0,
+                    "pnl": pnl,
+                    "pnl_pct": pnl / stake * 100 if stake else 0.0,
+                    "entered": True,
+                    "result": f"{status} | stake={stake:.2f}U | pnl={pnl:+.2f}U",
+                }
+                self.paper_results.append(row)
+                self.root.after(0, self.render_paper_results)
+                self.log_auto(logging.INFO, "三连阴实时第 %s 单: %s", layer, row["result"])
+                if cycle_done or layer == len(stakes):
+                    break
+            await self.sleep_with_stop(60, self.reversal_stop_requested)
+        return f"已停止，触发周期={cycle_count}"
 
     def live_auto_button_clicked(self):
         if self.live_auto_running:
