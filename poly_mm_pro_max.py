@@ -1625,6 +1625,10 @@ class PolyQuickTrader:
                 buy_details = await self.buy_quick_market(market, profile["direction"], stake, config["entry_price"])
                 entry = float(buy_details["price"])
                 size = float(buy_details["size"])
+                fill_verified = bool(buy_details.get("fill_verified"))
+                fill_status = buy_details.get("fill_status", "unknown")
+                if not fill_verified:
+                    self.log_live(logging.WARNING, "第 %s 单成交价未验证（fill_status=%s），后续 PnL 使用 limit 估算", layer, fill_status)
                 row = {
                     "round": f"R{cycle_count}-{layer}",
                     "slug": market.slug,
@@ -1637,13 +1641,13 @@ class PolyQuickTrader:
                     "pnl": -accumulated_loss,
                     "pnl_pct": 0.0,
                     "entered": True,
-                    "result": f"OPEN_REAL | stake={stake:.2f}U | entry={entry:.4f}",
+                    "result": f"OPEN_REAL | stake={stake:.2f}U | entry={entry:.4f} | verified={fill_verified}",
                 }
                 self.live_results.append(row)
                 self.root.after(0, self.render_live_results)
                 await self.push_to_server_chan(
                     "Polymarket 反转实盘买入",
-                    f"### Polymarket 反转实盘买入\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 金额: `{stake:.2f}` USDC\n- 入场: `{entry:.4f}`\n- 数量: `{size:.4f}`",
+                    f"### Polymarket 反转实盘买入\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 金额: `{stake:.2f}` USDC\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 数量: `{size:.4f}`",
                 )
 
                 wait_until_close = 0
@@ -1854,8 +1858,13 @@ class PolyQuickTrader:
         )
         if isinstance(resp, dict) and resp.get("success") is False:
             raise RuntimeError(f"交易所拒绝订单: {resp}")
-        await self.push_trade_result("快速买入", market.question, direction, size, price, resp, market_slug=market.slug)
-        return {"response": resp, "token_id": token_id, "price": price, "size": size, "tick_size": tick_size or market.tick_size}
+        fill = self._extract_fill(resp, limit_price=price, limit_size=size)
+        if fill["verified"]:
+            self.logger.info("成交确认: limit=%.4f×%.4f → fill=%.4f×%.4f status=%s", price, size, fill["fill_price"], fill["fill_size"], fill["status"])
+        else:
+            self.logger.warning("未拿到真实成交数据，仍用 limit 估算: status=%s resp_keys=%s", fill["status"], list(resp.keys()) if isinstance(resp, dict) else type(resp).__name__)
+        await self.push_trade_result("快速买入", market.question, direction, fill["fill_size"], fill["fill_price"], resp, market_slug=market.slug)
+        return {"response": resp, "token_id": token_id, "price": fill["fill_price"], "size": fill["fill_size"], "tick_size": tick_size or market.tick_size, "fill_status": fill["status"], "fill_verified": fill["verified"]}
 
     async def best_ask_for_token(self, client, token_id: str):
         orderbook = await asyncio.wait_for(asyncio.to_thread(client.get_order_book, token_id), timeout=15)
@@ -2160,6 +2169,29 @@ class PolyQuickTrader:
         tick = float(tick_size)
         decimals = self.price_decimals(tick_size)
         return round(min(max(price, tick), 1.0 - tick), decimals)
+
+    @staticmethod
+    def _extract_fill(resp, limit_price, limit_size):
+        if not isinstance(resp, dict):
+            return {"fill_price": float(limit_price), "fill_size": float(limit_size), "status": "unverified", "verified": False}
+        status_raw = resp.get("status")
+        status = str(status_raw).lower() if status_raw else ""
+        if status != "matched":
+            return {"fill_price": float(limit_price), "fill_size": float(limit_size), "status": status or "unverified", "verified": False}
+        making = resp.get("makingAmount")
+        taking = resp.get("takingAmount")
+        try:
+            making_f = float(making) if making is not None else None
+            taking_f = float(taking) if taking is not None else None
+        except (TypeError, ValueError):
+            making_f = taking_f = None
+        if making_f is None or taking_f is None or making_f <= 0 or taking_f <= 0:
+            return {"fill_price": float(limit_price), "fill_size": float(limit_size), "status": status, "verified": False}
+        fill_price = making_f / taking_f
+        fill_size = taking_f / 1_000_000.0
+        if not (0.0 < fill_price < 1.0):
+            return {"fill_price": float(limit_price), "fill_size": float(limit_size), "status": status, "verified": False}
+        return {"fill_price": fill_price, "fill_size": fill_size, "status": status, "verified": True}
 
     def _parse_token_ids(self, raw):
         if isinstance(raw, list):
