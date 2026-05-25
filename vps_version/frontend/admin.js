@@ -94,9 +94,25 @@ async function loadAdminUsers() {
   for (const user of data.users || []) {
     const row = document.createElement("tr");
     const canDelete = user.role !== "admin";
-    row.innerHTML = `<td>${user.username}</td><td>${user.role}</td><td>${user.password_change_required ? "是" : "否"}</td><td>${user.created_at || "--"}</td><td>${user.settings?.daily_report_time || "--"}</td><td>${canDelete ? `<button class="secondary" data-del="${user.username}">删除</button>` : ""}</td>`;
+    const pendingActions = user.status === "pending"
+      ? `<button data-approve="${user.username}">批准</button><button class="danger" data-reject="${user.username}">拒绝</button>`
+      : "";
+    row.innerHTML = `<td>${user.username}</td><td>${user.role}</td><td>${user.status || "approved"}</td><td>${user.password_change_required ? "是" : "否"}</td><td>${user.created_at || "--"}</td><td>${user.settings?.daily_report_time || "--"}</td><td>${pendingActions}${canDelete ? `<button class="secondary" data-del="${user.username}">删除</button>` : ""}</td>`;
     $("adminUsersBody").appendChild(row);
   }
+  document.querySelectorAll("[data-approve]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      show("adminBox", await api(`/api/admin/users/${encodeURIComponent(btn.dataset.approve)}/approve`, {method: "POST"}));
+      await loadAdminUsers();
+    });
+  });
+  document.querySelectorAll("[data-reject]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (!window.confirm(`确认拒绝并删除用户 ${btn.dataset.reject}？`)) return;
+      show("adminBox", await api(`/api/admin/users/${encodeURIComponent(btn.dataset.reject)}/reject`, {method: "POST"}));
+      await loadAdminUsers();
+    });
+  });
   document.querySelectorAll("[data-del]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       if (!window.confirm(`确认删除用户 ${btn.dataset.del}？`)) return;

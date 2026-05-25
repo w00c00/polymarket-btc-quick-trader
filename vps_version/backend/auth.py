@@ -13,6 +13,8 @@ DEFAULT_USERS_PATH = Path(os.environ.get("POLY_VPS_USERS_PATH", "data/users.json
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{3,32}$")
 DEFAULT_ADMIN_USERNAME = "poly"
 DEFAULT_ADMIN_PASSWORD = "123456"
+STATUS_APPROVED = "approved"
+STATUS_PENDING = "pending"
 
 
 def b64(value: bytes) -> str:
@@ -67,8 +69,14 @@ class UserStore:
                 user["role"] = "user"
                 user.setdefault("password_change_required", False)
                 changed = True
+            if "status" not in user:
+                user["status"] = STATUS_APPROVED
+                changed = True
         user = self.users.get(DEFAULT_ADMIN_USERNAME)
         if user and user.get("role") == "admin":
+            if user.get("status") != STATUS_APPROVED:
+                user["status"] = STATUS_APPROVED
+                changed = True
             if changed:
                 self._save()
             return
@@ -76,6 +84,7 @@ class UserStore:
             "password": password_hash(DEFAULT_ADMIN_PASSWORD),
             "created_at": int(time.time()),
             "role": "admin",
+            "status": STATUS_APPROVED,
             "settings": {},
             "password_change_required": True,
         }
@@ -93,6 +102,7 @@ class UserStore:
             "password": password_hash(password),
             "created_at": int(time.time()),
             "role": "user",
+            "status": STATUS_PENDING,
             "settings": {},
             "password_change_required": False,
         }
@@ -102,6 +112,8 @@ class UserStore:
         user = self.users.get(username)
         if not user or not verify_password(password, user.get("password") or {}):
             raise ValueError("用户名或密码错误。")
+        if user.get("status", STATUS_APPROVED) != STATUS_APPROVED:
+            raise ValueError("账号正在等待管理员审批。")
         token = secrets.token_urlsafe(32)
         self.sessions[token] = {
             "username": username,
@@ -115,6 +127,7 @@ class UserStore:
             "username": username,
             "role": user.get("role", "user"),
             "created_at": user.get("created_at"),
+            "status": user.get("status", STATUS_APPROVED),
             "settings": user.get("settings") or {},
             "password_change_required": bool(user.get("password_change_required")),
         }
@@ -142,6 +155,23 @@ class UserStore:
 
     def list_users(self):
         return [self.public_user(username) for username in sorted(self.users)]
+
+    def approve_user(self, username: str):
+        user = self.users.get(username)
+        if not user:
+            raise ValueError("用户不存在。")
+        if user.get("role") == "admin":
+            raise ValueError("管理员无需审批。")
+        user["status"] = STATUS_APPROVED
+        self._save()
+
+    def reject_user(self, username: str):
+        user = self.users.get(username)
+        if not user:
+            raise ValueError("用户不存在。")
+        if user.get("role") == "admin":
+            raise ValueError("不能拒绝管理员。")
+        self.delete_user(username)
 
     def is_admin(self, username: str):
         return (self.users.get(username) or {}).get("role") == "admin"

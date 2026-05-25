@@ -132,6 +132,19 @@ class ModelSettings(BaseModel):
     custom_model: str = ""
 
 
+MODEL_PROVIDERS = {
+    "minimax_cn": {"label": "MiniMax 国内版", "base_url": "https://api.minimaxi.com/v1", "default_model": "MiniMax-M2.7"},
+    "deepseek": {"label": "DeepSeek", "base_url": "https://api.deepseek.com/v1", "default_model": "deepseek-chat"},
+    "qwen": {"label": "阿里 Qwen", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "default_model": "qwen-plus"},
+    "kimi": {"label": "Kimi", "base_url": "https://api.moonshot.cn/v1", "default_model": "moonshot-v1-8k"},
+    "zhipu": {"label": "智谱 GLM", "base_url": "https://open.bigmodel.cn/api/paas/v4", "default_model": "glm-4-flash"},
+    "openai": {"label": "OpenAI", "base_url": "https://api.openai.com/v1", "default_model": "gpt-4.1-mini"},
+    "anthropic": {"label": "Anthropic Claude", "base_url": "https://api.anthropic.com", "default_model": "claude-3-5-sonnet-latest"},
+    "google": {"label": "Google Gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta", "default_model": "gemini-1.5-pro"},
+    "openrouter": {"label": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "default_model": "openai/gpt-4o-mini"},
+}
+
+
 def validate_mode(mode: str):
     if mode not in {REVERSAL_MODE_RED_UP, REVERSAL_MODE_GREEN_DOWN}:
         raise HTTPException(status_code=400, detail="未知策略模式")
@@ -159,6 +172,8 @@ def regular_user(username: str = Depends(current_user)):
     user = user_store.public_user(username)
     if user.get("role") == "admin":
         raise HTTPException(status_code=403, detail="管理员账号只用于后台管理，不能进行交易或保存交易凭证。")
+    if user.get("status") != "approved":
+        raise HTTPException(status_code=403, detail="账号正在等待管理员审批。")
     if user.get("password_change_required"):
         raise HTTPException(status_code=403, detail="请先修改初始密码。")
     return username
@@ -387,9 +402,8 @@ async def health():
 async def register(req: RegisterRequest):
     try:
         user_store.register(req.username, req.password)
-        token = user_store.login(req.username, req.password)
         user = user_store.public_user(req.username)
-        return {"ok": True, "token": token, **user}
+        return {"ok": True, "pending_approval": True, **user}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -454,6 +468,24 @@ async def admin_delete_user(target_username: str, username: str = Depends(admin_
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/admin/users/{target_username}/approve")
+async def admin_approve_user(target_username: str, _: str = Depends(admin_user)):
+    try:
+        user_store.approve_user(target_username)
+        return {"ok": True, "user": user_store.public_user(target_username)}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/users/{target_username}/reject")
+async def admin_reject_user(target_username: str, _: str = Depends(admin_user)):
+    try:
+        user_store.reject_user(target_username)
+        return {"ok": True}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/admin/cache/clear")
 async def admin_clear_cache(_: str = Depends(admin_user)):
     market_data.clear_cache()
@@ -480,15 +512,32 @@ async def get_notification_settings(username: str = Depends(regular_user)):
 
 @app.post("/api/settings/model")
 async def save_model_settings(req: ModelSettings, username: str = Depends(regular_user)):
-    settings = user_store.update_settings(username, {"model": req.model_dump()})
+    payload = req.model_dump()
+    if payload["preferred_provider"] == "custom":
+        if not payload["custom_base_url"] or not payload["custom_model"]:
+            raise HTTPException(status_code=400, detail="自定义接口需要填写 Base URL 和模型名。")
+    else:
+        provider = MODEL_PROVIDERS.get(payload["preferred_provider"])
+        if not provider:
+            raise HTTPException(status_code=400, detail="未知模型服务。")
+        payload["custom_base_url"] = ""
+        payload["custom_model"] = ""
+        payload["preferred_model"] = payload["preferred_model"] or provider["default_model"]
+    settings = user_store.update_settings(username, {"model": payload})
     return {"ok": True, "model": settings.get("model") or {}}
 
 
 @app.get("/api/settings/model")
 async def get_model_settings(username: str = Depends(regular_user)):
-    model = {"preferred_provider": "minimax_cn", "preferred_model": "MiniMax-M2.7", "custom_base_url": "", "custom_model": ""}
+    model = {"preferred_provider": "minimax_cn", "preferred_model": MODEL_PROVIDERS["minimax_cn"]["default_model"], "custom_base_url": "", "custom_model": ""}
     model.update((user_store.settings(username).get("model") or {}))
-    return model
+    provider = MODEL_PROVIDERS.get(model["preferred_provider"])
+    return {
+        **model,
+        "providers": MODEL_PROVIDERS,
+        "effective_base_url": provider["base_url"] if provider else model.get("custom_base_url", ""),
+        "effective_model": model.get("custom_model") if model["preferred_provider"] == "custom" else (model.get("preferred_model") or provider["default_model"]),
+    }
 
 
 @app.get("/api/vault/status")

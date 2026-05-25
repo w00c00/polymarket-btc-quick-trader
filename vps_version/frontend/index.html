@@ -27,7 +27,7 @@
       </div>
       <div class="toolbar">
         <button id="loginBtn">登录</button>
-        <button id="registerBtn" class="secondary">注册新用户</button>
+        <button id="registerBtn" class="secondary">提交注册申请</button>
       </div>
       <div class="notice">管理员请进入独立后台：<a href="/admin">/admin</a></div>
       <pre id="loginBox"></pre>
@@ -185,9 +185,10 @@
           </select>
         </label>
         <label>首选模型名 <input id="preferredModel" value="MiniMax-M2.7"></label>
-        <label>自定义 Base URL <input id="customBaseUrl" placeholder="https://.../v1"></label>
-        <label>自定义模型名 <input id="customModel"></label>
+        <label id="customBaseUrlWrap" class="hidden">自定义 Base URL <input id="customBaseUrl" placeholder="https://.../v1"></label>
+        <label id="customModelWrap" class="hidden">自定义模型名 <input id="customModel"></label>
       </div>
+      <div id="providerBaseHint" class="status-line">内置模型服务使用系统内置 Base URL，只有选择自定义接口时才需要填写 Base URL。</div>
       <div class="toolbar">
         <button id="loadModelBtn">读取模型配置</button>
         <button id="saveModelBtn">保存模型配置</button>

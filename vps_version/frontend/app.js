@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 let markets = [];
 let selectedMarket = null;
 let latestPositions = [];
+let modelProviders = {};
 
 for (const btn of document.querySelectorAll(".tab")) {
   btn.addEventListener("click", () => {
@@ -303,7 +304,7 @@ $("buyUpBtn").onclick = async () => { try { await submitManual("UP"); } catch (e
 $("buyDownBtn").onclick = async () => { try { await submitManual("DOWN"); } catch (e) { show("manualBox", e.message); } };
 
 $("loginBtn").onclick = async () => { try { const data = await api("/api/auth/login", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})}); afterLogin(data); } catch (e) { show("loginBox", e.message); } };
-$("registerBtn").onclick = async () => { try { const data = await api("/api/auth/register", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})}); afterLogin(data); } catch (e) { show("loginBox", e.message); } };
+$("registerBtn").onclick = async () => { try { const data = await api("/api/auth/register", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})}); show("loginBox", data.pending_approval ? "注册申请已提交，请等待管理员审批后再登录。" : data); } catch (e) { show("loginBox", e.message); } };
 $("logoutBtn").onclick = async () => { try { await api("/api/auth/logout", {method: "POST"}); } catch {} setAuth("", ""); showLoginView("已退出。"); };
 $("meBtn").onclick = async () => { try { show("accountBox", await api("/api/me")); } catch (e) { show("accountBox", e.message); } };
 $("changePasswordBtn").onclick = async () => { try { show("accountBox", await api("/api/auth/change_password", {method: "POST", body: JSON.stringify({old_password: $("oldPassword").value, new_password: $("newPassword").value})})); } catch (e) { show("accountBox", e.message); } };
@@ -327,7 +328,21 @@ $("loadNotifyBtn").onclick = async () => { try { const data = await api("/api/se
 $("saveNotifyBtn").onclick = async () => { try { show("notifyBox", await api("/api/settings/notifications", {method: "POST", body: JSON.stringify({telegram_bot_token: $("telegramToken").value, telegram_chat_id: $("telegramChat").value, daily_report_time: $("dailyReportTime").value || "21:30"})})); } catch (e) { show("notifyBox", e.message); } };
 $("sendReportBtn").onclick = async () => { try { show("notifyBox", await api("/api/reports/send_now", {method: "POST"})); } catch (e) { show("notifyBox", e.message); } };
 
-$("loadModelBtn").onclick = async () => { try { const data = await api("/api/settings/model"); $("preferredProvider").value = data.preferred_provider || "minimax_cn"; $("preferredModel").value = data.preferred_model || "MiniMax-M2.7"; $("customBaseUrl").value = data.custom_base_url || ""; $("customModel").value = data.custom_model || ""; show("modelBox", data); } catch (e) { show("modelBox", e.message); } };
+function updateModelProviderUi(data = {}) {
+  if (data.providers) modelProviders = data.providers;
+  const provider = $("preferredProvider").value;
+  const isCustom = provider === "custom";
+  $("customBaseUrlWrap").classList.toggle("hidden", !isCustom);
+  $("customModelWrap").classList.toggle("hidden", !isCustom);
+  const info = modelProviders[provider];
+  $("providerBaseHint").textContent = isCustom
+    ? "自定义接口需要填写 Base URL 和模型名。"
+    : `当前使用内置 Base URL：${info?.base_url || "内置"}；无需单独填写。`;
+  if (info && data.preferred_provider !== provider) $("preferredModel").value = info.default_model;
+}
+
+$("preferredProvider").onchange = () => updateModelProviderUi();
+$("loadModelBtn").onclick = async () => { try { const data = await api("/api/settings/model"); $("preferredProvider").value = data.preferred_provider || "minimax_cn"; $("preferredModel").value = data.preferred_model || "MiniMax-M2.7"; $("customBaseUrl").value = data.custom_base_url || ""; $("customModel").value = data.custom_model || ""; updateModelProviderUi(data); show("modelBox", data); } catch (e) { show("modelBox", e.message); } };
 $("saveModelBtn").onclick = async () => { try { show("modelBox", await api("/api/settings/model", {method: "POST", body: JSON.stringify({preferred_provider: $("preferredProvider").value, preferred_model: $("preferredModel").value, custom_base_url: $("customBaseUrl").value, custom_model: $("customModel").value})})); } catch (e) { show("modelBox", e.message); } };
 
 setInterval(() => {
