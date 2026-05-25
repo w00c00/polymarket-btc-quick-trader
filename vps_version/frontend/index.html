@@ -36,7 +36,7 @@
       <div id="selectedMarketBox" class="status-line">未选择市场</div>
       <pre id="healthBox"></pre>
       <table>
-        <thead><tr><th>选择</th><th>周期</th><th>结束</th><th>Up</th><th>Down</th><th>量</th><th>市场</th></tr></thead>
+        <thead><tr><th>选择</th><th>周期</th><th>北京时间</th><th>Up</th><th>Down</th><th>量</th><th>市场</th></tr></thead>
         <tbody id="marketsBody"></tbody>
       </table>
     </section>
@@ -100,6 +100,7 @@
     </section>
 
     <section id="live" class="panel">
+      <div class="notice">任务页 dry-run 是独立任务状态，只写入下方任务日志；回测页的“运行回测”是一次性历史统计，两者不会互相覆盖。</div>
       <div class="form-grid">
         <label>策略
           <select id="liveMode">

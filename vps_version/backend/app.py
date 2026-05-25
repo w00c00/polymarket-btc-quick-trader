@@ -12,6 +12,7 @@ from core import (
     MarketData,
     REVERSAL_MODE_GREEN_DOWN,
     REVERSAL_MODE_RED_UP,
+    fmt_kline_time,
     local_btc_probability_from_rows,
     reversal_stakes,
     run_reversal_backtest_from_rows,
@@ -201,13 +202,13 @@ async def strategy_backtest(req: BacktestRequest):
 
 async def dry_run_live_job(job_id: str, config: dict):
     jobs[job_id]["status"] = "running"
-    jobs[job_id]["events"].append("dry-run 已启动。当前版本不会自动提交真实订单。")
+    jobs[job_id]["events"].append("任务 dry-run 已启动。它只写入任务页状态，不会覆盖回测页结果，也不会自动提交真实订单。")
     end_time = asyncio.get_running_loop().time() + config["max_hours"] * 3600
     while jobs[job_id].get("status") == "running" and asyncio.get_running_loop().time() < end_time:
         try:
             rows = await market_data.fetch_btc_15m_klines(3)
-            jobs[job_id]["last_kline"] = rows[-1][0] if rows else None
-            jobs[job_id]["events"].append(f"心跳: 已读取 {len(rows)} 根 15m K线")
+            jobs[job_id]["last_kline"] = fmt_kline_time(rows[-1]) if rows else None
+            jobs[job_id]["events"].append(f"心跳: 已读取 {len(rows)} 根 15m K线，最后一根 {jobs[job_id]['last_kline']}")
         except Exception as exc:
             jobs[job_id]["events"].append(f"读取失败: {exc}")
         jobs[job_id]["events"] = jobs[job_id]["events"][-100:]

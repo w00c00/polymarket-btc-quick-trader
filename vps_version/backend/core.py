@@ -3,13 +3,14 @@ import json
 import re
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
 
 GAMMA_EVENT_SLUG_URL = "https://gamma-api.polymarket.com/events/slug"
 POLYMARKET_BASE_URL = "https://polymarket.com"
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 REVERSAL_MODE_RED_UP = "三连阴转UP"
 REVERSAL_MODE_GREEN_DOWN = "三连阳转DOWN"
@@ -24,7 +25,11 @@ class QuickMarket:
     no_id: str
     tick_size: str
     period: str
+    start_dt: str | None
     end_dt: str | None
+    start_dt_bj: str | None
+    end_dt_bj: str | None
+    time_label_bj: str
     ended: bool
     up_bid: float
     up_ask: float
@@ -55,9 +60,34 @@ def parse_datetime(value):
         return datetime.fromtimestamp(value, tz=timezone.utc)
     text = str(value).replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
     except ValueError:
         return None
+
+
+def fmt_beijing(dt: datetime | None, with_tz=True):
+    if not dt:
+        return None
+    value = dt.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
+    return f"{value} 北京时间" if with_tz else value
+
+
+def slug_start_datetime(slug: str):
+    match = re.search(r"updown-\d+[mh]-(\d{9,})", slug)
+    if not match:
+        return None
+    return datetime.fromtimestamp(int(match.group(1)), tz=timezone.utc)
+
+
+def period_seconds(period: str):
+    match = re.fullmatch(r"(\d+)([mh])", period or "")
+    if not match:
+        return None
+    value = int(match.group(1))
+    return value * (60 if match.group(2) == "m" else 3600)
 
 
 def parse_token_ids(value):
@@ -115,7 +145,11 @@ def quick_market_candidate(event: dict, market: dict, now: datetime):
     if "up" not in question.lower() or "down" not in question.lower():
         return None
 
-    end_dt = parse_datetime(market.get("endDate") or event.get("endDate"))
+    period = quick_period_from_slug_or_title(slug, question)
+    start_dt = slug_start_datetime(slug)
+    seconds = period_seconds(period)
+    slug_end_dt = start_dt + timedelta(seconds=seconds) if start_dt and seconds else None
+    end_dt = slug_end_dt or parse_datetime(market.get("endDate") or event.get("endDate"))
     best_bid = optional_float(market.get("bestBid"))
     best_ask = optional_float(market.get("bestAsk"))
     if best_bid is None or best_ask is None or best_bid <= 0 or best_ask >= 1 or best_bid >= best_ask:
@@ -128,8 +162,15 @@ def quick_market_candidate(event: dict, market: dict, now: datetime):
         yes_id=token_ids[0],
         no_id=token_ids[1],
         tick_size=str(market.get("orderPriceMinTickSize") or "0.01"),
-        period=quick_period_from_slug_or_title(slug, question),
+        period=period,
+        start_dt=start_dt.isoformat() if start_dt else None,
         end_dt=end_dt.isoformat() if end_dt else None,
+        start_dt_bj=fmt_beijing(start_dt, with_tz=False),
+        end_dt_bj=fmt_beijing(end_dt, with_tz=False),
+        time_label_bj=(
+            f"{fmt_beijing(start_dt, with_tz=False)} - {fmt_beijing(end_dt, with_tz=False)} 北京时间"
+            if start_dt and end_dt else (fmt_beijing(end_dt) or "--")
+        ),
         ended=bool(end_dt and end_dt <= now),
         up_bid=best_bid,
         up_ask=best_ask,
@@ -347,6 +388,7 @@ def local_btc_probability_from_rows(rows, market=None):
         "market": market or {},
         "last_price": last,
         "last_kline": fmt_kline_time(rows[-1]),
+        "last_kline_bj": fmt_kline_time(rows[-1]),
         "up_probability": up_probability,
         "down_probability": down_probability,
         "confidence": confidence,
@@ -364,7 +406,7 @@ def local_btc_probability_from_rows(rows, market=None):
 
 
 def fmt_kline_time(row):
-    return datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc).astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M 北京时间")
 
 
 def run_reversal_backtest_from_rows(rows, mode, initial_usdc, max_layers, entry_price, fee_rate=0.07):

@@ -87,7 +87,7 @@ function setSelectedMarket(index) {
     $("selectedMarketBox").className = "status-line warn";
     return;
   }
-  $("selectedMarketBox").textContent = `已选择：${selectedMarket.period} | ${selectedMarket.question} | Up ${formatPrice(selectedMarket.up_bid)}/${formatPrice(selectedMarket.up_ask)} Down ${formatPrice(selectedMarket.down_bid)}/${formatPrice(selectedMarket.down_ask)}`;
+  $("selectedMarketBox").textContent = `已选择：${selectedMarket.period} | ${selectedMarket.time_label_bj || selectedMarket.end_dt_bj || selectedMarket.end_dt || "--"} | ${selectedMarket.question} | Up ${formatPrice(selectedMarket.up_bid)}/${formatPrice(selectedMarket.up_ask)} Down ${formatPrice(selectedMarket.down_bid)}/${formatPrice(selectedMarket.down_ask)}`;
   $("selectedMarketBox").className = "status-line ok";
 }
 
@@ -143,7 +143,7 @@ $("scanBtn").onclick = async () => {
     for (const [index, m] of markets.entries()) {
       const row = document.createElement("tr");
       row.dataset.index = String(index);
-      row.innerHTML = `<td><button class="secondary" data-select="${index}">选择</button></td><td>${m.period}</td><td>${m.end_dt || "--"}</td><td>${formatPrice(m.up_bid)}/${formatPrice(m.up_ask)}</td><td>${formatPrice(m.down_bid)}/${formatPrice(m.down_ask)}</td><td>${Math.round(m.volume24h)}</td><td>${m.question}</td>`;
+      row.innerHTML = `<td><button class="secondary" data-select="${index}">选择</button></td><td>${m.period}</td><td>${m.time_label_bj || m.end_dt_bj || m.end_dt || "--"}</td><td>${formatPrice(m.up_bid)}/${formatPrice(m.up_ask)}</td><td>${formatPrice(m.down_bid)}/${formatPrice(m.down_ask)}</td><td>${Math.round(m.volume24h)}</td><td>${m.question}</td>`;
       row.addEventListener("click", (event) => {
         if (event.target?.tagName === "BUTTON" || event.target?.tagName === "TD") {
           setSelectedMarket(index);
@@ -167,12 +167,13 @@ $("predictBtn").onclick = async () => {
     const data = await api("/api/strategy/predict", {method: "POST", body: JSON.stringify({market: selectedMarket, days: 3})});
     show("healthBox", {
       market: `${selectedMarket.period} ${selectedMarket.question}`,
+      market_time_bj: selectedMarket.time_label_bj || selectedMarket.end_dt_bj || selectedMarket.end_dt,
       action: data.action,
       up_probability: formatPct(data.up_probability),
       down_probability: formatPct(data.down_probability),
       confidence: formatPct(data.confidence),
       last_price: Number(data.last_price.toFixed(2)),
-      last_kline: data.last_kline,
+      last_kline: data.last_kline_bj || data.last_kline,
       signals: data.signals,
       note: data.note,
     });
