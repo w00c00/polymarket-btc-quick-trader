@@ -1574,7 +1574,17 @@ class PolyQuickTrader:
         self.log_live(logging.WARNING, "%s 实盘下注序列: %s", profile["label"], " -> ".join(f"{x:.2f}" for x in stakes))
         seen_triggers = set()
         cycle_count = 0
+        heartbeat_interval_cycles = 10
+        last_heartbeat_cycle = 0
+        cycle_pnl_running = 0.0
         while not self.live_auto_stop_requested.is_set() and time.time() < deadline:
+            if cycle_count - last_heartbeat_cycle >= heartbeat_interval_cycles and cycle_count > 0:
+                remaining_hours = max(0.0, (deadline - time.time()) / 3600.0)
+                await self.push_to_server_chan(
+                    "Polymarket 反转实盘心跳",
+                    f"### Polymarket 反转实盘心跳\n\n- 策略: `{profile['label']}`\n- 已触发周期: `{cycle_count}`\n- 累计估算 pnl: `{cycle_pnl_running:+.2f}` USDC\n- 剩余小时: `{remaining_hours:.1f}`",
+                )
+                last_heartbeat_cycle = cycle_count
             rows = await self.fetch_btc_15m_klines(3)
             if len(rows) < 6:
                 await self.sleep_with_stop(60, self.live_auto_stop_requested)
@@ -1670,6 +1680,20 @@ class PolyQuickTrader:
                         "Polymarket 反转实盘结果",
                         f"### Polymarket 反转实盘结果\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 结果: `WIN`\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 结算: `data-api redeemable`\n- 本行盈亏估算: `{pnl:+.2f}` USDC",
                     )
+                    self._append_trade_journal({
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "strategy": profile["label"], "cycle": cycle_count, "layer": layer,
+                        "market_slug": market.slug, "direction": profile["direction"],
+                        "stake_usdc": f"{stake:.4f}", "requested_price": f"{config['entry_price']:.4f}",
+                        "fill_price": f"{entry:.4f}", "fill_size": f"{size:.6f}",
+                        "fill_verified": str(fill_verified), "outcome": outcome,
+                        "pnl_estimate": f"{pnl:+.4f}", "accumulated_loss": f"{accumulated_loss:.4f}",
+                    })
+                    # WIN path: `pnl` already subtracted accumulated_loss for this cycle, but
+                    # the prior LOSS layers already added their own -loss to cycle_pnl_running.
+                    # Adding `pnl` directly here would double-count earlier losses. Restore the
+                    # accumulated_loss term so the running total is the sum of per-layer outcomes.
+                    cycle_pnl_running += pnl + accumulated_loss
                     break
                 if outcome == "pending_timeout":
                     self.log_live(logging.ERROR, "%s 实盘第 %s 单结算异常 (deadline 超出，需人工介入)", profile["label"], layer)
@@ -1677,6 +1701,15 @@ class PolyQuickTrader:
                         "Polymarket 反转实盘 ⚠️ 结算异常",
                         f"### ⚠️ 反转实盘结算异常\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 市场: `{market.slug}`\n- token: `{token_id_settled[:12]}...`\n- 入场: `{entry:.4f}`\n- 仓位结算状态超 deadline 未确定，请去 polymarket.com/portfolio 人工核对",
                     )
+                    self._append_trade_journal({
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "strategy": profile["label"], "cycle": cycle_count, "layer": layer,
+                        "market_slug": market.slug, "direction": profile["direction"],
+                        "stake_usdc": f"{stake:.4f}", "requested_price": f"{config['entry_price']:.4f}",
+                        "fill_price": f"{entry:.4f}", "fill_size": f"{size:.6f}",
+                        "fill_verified": str(fill_verified), "outcome": outcome,
+                        "pnl_estimate": "0.0000", "accumulated_loss": f"{accumulated_loss:.4f}",
+                    })
                     return f"已停止 (结算异常)，触发周期={cycle_count}"
                 # outcome == "loss"
                 loss = entry * size
@@ -1689,6 +1722,16 @@ class PolyQuickTrader:
                     "Polymarket 反转实盘结果",
                     f"### Polymarket 反转实盘结果\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 结果: `LOSS`\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 结算: `data-api 仓位归零`\n- 本行盈亏估算: `{pnl:+.2f}` USDC",
                 )
+                self._append_trade_journal({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "strategy": profile["label"], "cycle": cycle_count, "layer": layer,
+                    "market_slug": market.slug, "direction": profile["direction"],
+                    "stake_usdc": f"{stake:.4f}", "requested_price": f"{config['entry_price']:.4f}",
+                    "fill_price": f"{entry:.4f}", "fill_size": f"{size:.6f}",
+                    "fill_verified": str(fill_verified), "outcome": outcome,
+                    "pnl_estimate": f"{pnl:+.4f}", "accumulated_loss": f"{accumulated_loss:.4f}",
+                })
+                cycle_pnl_running += pnl
                 if self.live_auto_stop_requested.is_set():
                     break
             await self.sleep_with_stop(60, self.live_auto_stop_requested)
@@ -2020,6 +2063,34 @@ class PolyQuickTrader:
             backoff = min(backoff * 1.5, 60.0)
         return "pending_timeout"
 
+    @staticmethod
+    def _append_trade_journal(row: dict, path: str = "trade_journal.csv"):
+        """
+        Append a single trade settlement row to CSV at `path`.
+        Creates the file with header on first write. Best-effort: caller's
+        flow must not depend on this succeeding (logs warning on error).
+
+        Required row keys:
+          ts, strategy, cycle, layer, market_slug, direction,
+          stake_usdc, requested_price, fill_price, fill_size,
+          fill_verified, outcome, pnl_estimate, accumulated_loss
+        """
+        import csv
+        fieldnames = [
+            "ts", "strategy", "cycle", "layer", "market_slug", "direction",
+            "stake_usdc", "requested_price", "fill_price", "fill_size",
+            "fill_verified", "outcome", "pnl_estimate", "accumulated_loss",
+        ]
+        try:
+            need_header = not os.path.exists(path) or os.path.getsize(path) == 0
+            with open(path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                if need_header:
+                    writer.writeheader()
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+        except OSError as e:
+            logging.getLogger("PolyQuickTrader").warning("trade journal append 失败: %s", e)
+
     def refresh_positions_button_clicked(self):
         def worker():
             loop = asyncio.new_event_loop()
@@ -2294,9 +2365,12 @@ class PolyQuickTrader:
 
     def _float_or_zero(self, value):
         try:
-            return float(value)
+            result = float(value)
         except (TypeError, ValueError):
             return 0.0
+        if result != result or result in (float("inf"), float("-inf")):
+            return 0.0
+        return result
 
     def _optional_float(self, value):
         try:
