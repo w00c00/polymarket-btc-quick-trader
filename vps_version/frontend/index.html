@@ -19,6 +19,36 @@
   </header>
 
   <main>
+    <section id="loginView" class="auth-card">
+      <h2>用户登录</h2>
+      <div class="form-grid">
+        <label>用户名 <input id="username" autocomplete="username"></label>
+        <label>密码 <input id="password" type="password" autocomplete="current-password"></label>
+      </div>
+      <div class="toolbar">
+        <button id="loginBtn">登录</button>
+        <button id="registerBtn" class="secondary">注册新用户</button>
+      </div>
+      <div class="notice">管理员请进入独立后台：<a href="/admin">/admin</a></div>
+      <pre id="loginBox"></pre>
+    </section>
+
+    <section id="forcePasswordView" class="auth-card hidden">
+      <h2>修改初始密码</h2>
+      <div class="notice">当前账号需要先修改密码，完成后会进入控制台。</div>
+      <div class="form-grid">
+        <label>旧密码 <input id="forceOldPassword" type="password" autocomplete="current-password"></label>
+        <label>新密码 <input id="forceNewPassword" type="password" autocomplete="new-password"></label>
+      </div>
+      <div class="toolbar">
+        <button id="forceChangePasswordBtn">确认修改</button>
+        <button id="forceLogoutBtn" class="secondary">退出</button>
+      </div>
+      <pre id="forcePasswordBox"></pre>
+    </section>
+
+    <section id="appView" class="hidden">
+    <div id="sessionBanner" class="status-line ok">已登录</div>
     <nav>
       <button class="tab active" data-tab="manual">手动交易</button>
       <button class="tab" data-tab="strategy">策略任务</button>
@@ -182,23 +212,20 @@
     </section>
 
     <section id="account" class="panel">
+      <div id="accountStatus" class="status-line">已登录</div>
       <div class="form-grid">
-        <label>用户名 <input id="username" autocomplete="username"></label>
-        <label>密码 <input id="password" type="password" autocomplete="current-password"></label>
         <label>旧密码 <input id="oldPassword" type="password" autocomplete="current-password"></label>
         <label>新密码 <input id="newPassword" type="password" autocomplete="new-password"></label>
       </div>
       <div class="toolbar">
-        <button id="loginBtn">登录</button>
-        <button id="registerBtn">注册</button>
         <button id="logoutBtn">退出</button>
         <button id="meBtn">我的状态</button>
         <button id="changePasswordBtn">修改密码</button>
       </div>
-      <div id="accountStatus" class="status-line">未登录</div>
       <pre id="accountBox"></pre>
     </section>
 
+    </section>
   </main>
 
   <script src="/static/app.js"></script>

@@ -19,28 +19,40 @@
   </header>
 
   <main>
-    <section class="panel active">
+    <section id="adminLoginView" class="auth-card">
       <div class="notice">默认管理员账号为 poly，默认密码为 123456。首次登录后必须修改密码，才能使用后台管理功能。</div>
       <div class="form-grid">
         <label>管理员账号 <input id="username" value="poly" autocomplete="username"></label>
         <label>密码 <input id="password" type="password" autocomplete="current-password"></label>
+      </div>
+      <div class="toolbar">
+        <button id="loginBtn">登录后台</button>
+      </div>
+      <pre id="loginBox"></pre>
+    </section>
+
+    <section id="adminForcePasswordView" class="auth-card hidden">
+      <h2>修改默认管理员密码</h2>
+      <div class="notice">首次登录必须修改默认密码，完成后自动进入后台。</div>
+      <div class="form-grid">
         <label>旧密码 <input id="oldPassword" type="password" autocomplete="current-password"></label>
         <label>新密码 <input id="newPassword" type="password" autocomplete="new-password"></label>
       </div>
       <div class="toolbar">
-        <button id="loginBtn">登录后台</button>
-        <button id="changePasswordBtn">修改管理员密码</button>
-        <button id="logoutBtn">退出</button>
-        <button id="meBtn">状态</button>
+        <button id="changePasswordBtn">确认修改</button>
+        <button id="forceLogoutBtn" class="secondary">退出</button>
       </div>
       <pre id="accountBox"></pre>
     </section>
 
-    <section class="panel active">
+    <section id="adminAppView" class="hidden">
+      <div id="adminBanner" class="status-line ok">管理员已登录</div>
       <div class="toolbar">
         <button id="adminUsersBtn">刷新用户</button>
         <button id="adminJobsBtn">查看任务</button>
         <button id="clearCacheBtn">清理缓存</button>
+        <button id="meBtn" class="secondary">状态</button>
+        <button id="logoutBtn" class="secondary">退出</button>
       </div>
       <table>
         <thead><tr><th>用户</th><th>角色</th><th>强制改密</th><th>创建时间</th><th>报告时间</th><th>操作</th></tr></thead>

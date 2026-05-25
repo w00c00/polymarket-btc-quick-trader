@@ -36,11 +36,14 @@ function setAuth(token, username) {
 function afterLogin(data) {
   setAuth(data.token, data.username);
   if (data.role === "admin") {
-    show("accountBox", "管理员账号只用于独立后台，请打开 /admin。");
+    window.location.href = "/admin";
+    return;
   }
   if (data.password_change_required) {
-    show("accountBox", "该账号必须先修改初始密码。请在下方填写旧密码和新密码。");
+    showForcePasswordView("该账号必须先修改初始密码。");
+    return;
   }
+  showAppView(data.username);
 }
 
 function updateLoginState() {
@@ -48,6 +51,57 @@ function updateLoginState() {
   $("loginState").textContent = username ? `已登录: ${username}` : "未登录";
   $("accountStatus").textContent = username ? `当前已登录账号：${username}` : "未登录";
   $("accountStatus").className = username ? "status-line ok" : "status-line warn";
+  if ($("sessionBanner")) $("sessionBanner").textContent = username ? `已登录：${username}` : "未登录";
+}
+
+function setActiveTab(tabId) {
+  document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === tabId));
+  document.querySelectorAll(".panel").forEach((x) => x.classList.toggle("active", x.id === tabId));
+}
+
+function showLoginView(message = "") {
+  $("loginView").classList.remove("hidden");
+  $("forcePasswordView").classList.add("hidden");
+  $("appView").classList.add("hidden");
+  if (message) show("loginBox", message);
+}
+
+function showForcePasswordView(message = "") {
+  $("loginView").classList.add("hidden");
+  $("forcePasswordView").classList.remove("hidden");
+  $("appView").classList.add("hidden");
+  if (message) show("forcePasswordBox", message);
+}
+
+function showAppView(username = localStorage.getItem("poly_vps_username")) {
+  $("loginView").classList.add("hidden");
+  $("forcePasswordView").classList.add("hidden");
+  $("appView").classList.remove("hidden");
+  updateLoginState();
+  setActiveTab("manual");
+  if (username) $("sessionBanner").textContent = `已登录：${username}`;
+}
+
+async function bootstrapSession() {
+  if (!authToken()) {
+    showLoginView();
+    return;
+  }
+  try {
+    const data = await api("/api/me");
+    if (data.role === "admin") {
+      window.location.href = "/admin";
+      return;
+    }
+    if (data.password_change_required) {
+      showForcePasswordView("该账号必须先修改初始密码。");
+      return;
+    }
+    showAppView(data.username);
+  } catch {
+    setAuth("", "");
+    showLoginView("登录已失效，请重新登录。");
+  }
 }
 
 async function api(path, options = {}) {
@@ -239,7 +293,7 @@ async function encryptedVaultBlob() {
   return {version: 1, kdf: "PBKDF2-SHA256", iterations, salt: bytesToB64(salt), nonce: bytesToB64(nonce), ciphertext: bytesToB64(ciphertext)};
 }
 
-updateLoginState();
+bootstrapSession();
 
 $("healthBtn").onclick = async () => { try { show("manualBox", await api("/api/health")); } catch (e) { show("manualBox", e.message); } };
 $("scanBtn").onclick = async () => { $("marketsBody").innerHTML = "<tr><td colspan='7'>扫描中...</td></tr>"; try { renderMarkets((await api("/api/markets/quick")).items); } catch (e) { $("marketsBody").innerHTML = `<tr><td colspan='7'>${e.message}</td></tr>`; } };
@@ -248,11 +302,13 @@ $("snapshotBtn").onclick = async () => { try { await refreshSnapshot(); } catch 
 $("buyUpBtn").onclick = async () => { try { await submitManual("UP"); } catch (e) { show("manualBox", e.message); } };
 $("buyDownBtn").onclick = async () => { try { await submitManual("DOWN"); } catch (e) { show("manualBox", e.message); } };
 
-$("loginBtn").onclick = async () => { try { const data = await api("/api/auth/login", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})}); afterLogin(data); show("accountBox", {ok: true, message: "登录成功", username: data.username, role: data.role, password_change_required: data.password_change_required}); } catch (e) { show("accountBox", e.message); } };
-$("registerBtn").onclick = async () => { try { const data = await api("/api/auth/register", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})}); afterLogin(data); show("accountBox", {ok: true, message: "注册并登录成功", username: data.username, role: data.role}); } catch (e) { show("accountBox", e.message); } };
-$("logoutBtn").onclick = async () => { try { await api("/api/auth/logout", {method: "POST"}); } catch {} setAuth("", ""); show("accountBox", "已退出。"); };
+$("loginBtn").onclick = async () => { try { const data = await api("/api/auth/login", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})}); afterLogin(data); } catch (e) { show("loginBox", e.message); } };
+$("registerBtn").onclick = async () => { try { const data = await api("/api/auth/register", {method: "POST", body: JSON.stringify({username: $("username").value, password: $("password").value})}); afterLogin(data); } catch (e) { show("loginBox", e.message); } };
+$("logoutBtn").onclick = async () => { try { await api("/api/auth/logout", {method: "POST"}); } catch {} setAuth("", ""); showLoginView("已退出。"); };
 $("meBtn").onclick = async () => { try { show("accountBox", await api("/api/me")); } catch (e) { show("accountBox", e.message); } };
 $("changePasswordBtn").onclick = async () => { try { show("accountBox", await api("/api/auth/change_password", {method: "POST", body: JSON.stringify({old_password: $("oldPassword").value, new_password: $("newPassword").value})})); } catch (e) { show("accountBox", e.message); } };
+$("forceChangePasswordBtn").onclick = async () => { try { const data = await api("/api/auth/change_password", {method: "POST", body: JSON.stringify({old_password: $("forceOldPassword").value, new_password: $("forceNewPassword").value})}); showAppView(data.username); } catch (e) { show("forcePasswordBox", e.message); } };
+$("forceLogoutBtn").onclick = async () => { try { await api("/api/auth/logout", {method: "POST"}); } catch {} setAuth("", ""); showLoginView("已退出。"); };
 
 $("capitalBtn").onclick = async () => { try { const data = await api("/api/strategy/capital", {method: "POST", body: JSON.stringify(params(""))}); show("capitalBox", {stakes: data.stakes.map((x) => Number(x.toFixed(2))), stake_sum: Number(data.stake_sum.toFixed(2)), worst_loss: Number(data.worst_loss.toFixed(2)), recommended_single_strategy_usdc: data.recommended_single_strategy_usdc, recommended_both_strategies_usdc: data.recommended_both_strategies_usdc}); } catch (e) { show("capitalBox", e.message); } };
 $("backtestBtn").onclick = async () => { try { const body = {...params(""), days: Number($("days").value)}; const data = await api("/api/strategy/backtest", {method: "POST", body: JSON.stringify(body)}); show("backtestBox", {label: data.label, range: `${data.from} -> ${data.to}`, cycles: data.cycles, wins: data.wins, losses: data.losses, win_rate: `${(data.win_rate * 100).toFixed(2)}%`, total_pnl: Number(data.total_pnl.toFixed(2)), max_drawdown: Number(data.max_drawdown.toFixed(2)), recent: data.recent}); } catch (e) { show("backtestBox", e.message); } };

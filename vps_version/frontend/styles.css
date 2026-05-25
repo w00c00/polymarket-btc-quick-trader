@@ -24,8 +24,26 @@ p {
   color: #4b5563;
   margin: 0;
 }
+a {
+  color: #1d4ed8;
+}
 main {
   padding: 18px 24px 40px;
+}
+.hidden {
+  display: none !important;
+}
+.auth-card {
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  margin: 32px auto;
+  max-width: 760px;
+  padding: 22px;
+}
+.auth-card h2 {
+  font-size: 18px;
+  margin: 0 0 14px;
 }
 nav {
   display: flex;
@@ -55,6 +73,10 @@ button.secondary {
   background: #ffffff;
   border-color: #cbd5e1;
   color: #111827;
+}
+button.danger {
+  background: #b91c1c;
+  border-color: #b91c1c;
 }
 input, select {
   border: 1px solid #cbd5e1;
