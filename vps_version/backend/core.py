@@ -184,6 +184,10 @@ def quick_market_candidate(event: dict, market: dict, now: datetime):
 class MarketData:
     def __init__(self):
         self.headers = {"User-Agent": "Mozilla/5.0"}
+        self._cache = {}
+
+    def clear_cache(self):
+        self._cache.clear()
 
     async def fetch_json(self, url: str, params=None):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), headers=self.headers) as session:
@@ -200,6 +204,10 @@ class MarketData:
                 return await response.text()
 
     async def fetch_quick_btc_markets(self):
+        cache_key = "quick_markets"
+        cached = self._cache.get(cache_key)
+        if cached and time.time() - cached["ts"] < 20:
+            return cached["value"]
         html = await self.fetch_text(f"{POLYMARKET_BASE_URL}/crypto/bitcoin")
         slugs = []
         for match in re.finditer(r'href="/(?:zh/)?event/([^"?#/]+)', html):
@@ -228,9 +236,15 @@ class MarketData:
                 if item:
                     markets.append(asdict(item))
         markets.sort(key=lambda item: (item["ended"], item["end_dt"] or "9999"))
-        return markets[:20]
+        value = markets[:20]
+        self._cache[cache_key] = {"ts": time.time(), "value": value}
+        return value
 
     async def fetch_btc_15m_klines(self, days=7, limit=1000):
+        cache_key = f"klines:{days}:{limit}"
+        cached = self._cache.get(cache_key)
+        if cached and time.time() - cached["ts"] < 60:
+            return cached["value"]
         end_ms = int(time.time() * 1000)
         start_ms = end_ms - int(days * 24 * 3600 * 1000)
         rows = []
@@ -268,7 +282,9 @@ class MarketData:
         for row in rows:
             if int(row[6]) <= now_ms:
                 deduped[int(row[0])] = row
-        return [deduped[key] for key in sorted(deduped)]
+        value = [deduped[key] for key in sorted(deduped)]
+        self._cache[cache_key] = {"ts": time.time(), "value": value}
+        return value
 
 
 def reversal_profile(mode):

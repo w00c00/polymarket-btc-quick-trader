@@ -68,6 +68,8 @@ class UserStore:
         self.users[username] = {
             "password": password_hash(password),
             "created_at": int(time.time()),
+            "role": "admin" if not self.users else "user",
+            "settings": {},
         }
         self._save()
 
@@ -94,4 +96,39 @@ class UserStore:
         return session["username"]
 
     def list_users(self):
-        return sorted(self.users)
+        return [
+            {
+                "username": username,
+                "role": user.get("role", "user"),
+                "created_at": user.get("created_at"),
+                "settings": user.get("settings") or {},
+            }
+            for username, user in sorted(self.users.items())
+        ]
+
+    def is_admin(self, username: str):
+        return (self.users.get(username) or {}).get("role") == "admin"
+
+    def delete_user(self, username: str):
+        if username not in self.users:
+            raise ValueError("用户不存在。")
+        if self.users[username].get("role") == "admin":
+            admin_count = sum(1 for item in self.users.values() if item.get("role") == "admin")
+            if admin_count <= 1:
+                raise ValueError("不能删除最后一个管理员。")
+        self.users.pop(username)
+        for token, session in list(self.sessions.items()):
+            if session.get("username") == username:
+                self.sessions.pop(token, None)
+        self._save()
+
+    def update_settings(self, username: str, settings: dict):
+        if username not in self.users:
+            raise ValueError("用户不存在。")
+        current = self.users[username].setdefault("settings", {})
+        current.update(settings)
+        self._save()
+        return current
+
+    def settings(self, username: str):
+        return (self.users.get(username) or {}).get("settings") or {}
