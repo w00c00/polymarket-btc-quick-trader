@@ -18,6 +18,59 @@ from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, S
 from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import ApiCreds
 
+# --- Phase 7: shared aiohttp session per asyncio loop ----------------------
+_AIOHTTP_SESSIONS: "dict[int, aiohttp.ClientSession]" = {}
+_AIOHTTP_SESSIONS_LOCK = threading.Lock()
+
+
+def _get_aiohttp_session(default_timeout_total: float = 12.0,
+                        headers: dict | None = None) -> aiohttp.ClientSession:
+    """
+    Return a shared aiohttp.ClientSession bound to the current running loop.
+
+    Keyed by id(loop) so each GUI-click loop gets its own session and closure
+    of a previous loop doesn't poison subsequent clicks. Callers SHOULD pass
+    a per-request `timeout=` to `session.get/post/...` when they need a
+    timeout different from `default_timeout_total` — the session's default
+    is only used when the caller omits `timeout=`.
+    """
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    with _AIOHTTP_SESSIONS_LOCK:
+        # GC stale cached sessions whose loops have been closed by their
+        # short-lived GUI-click workers (Final Codex P2: each click runs
+        # asyncio.new_event_loop()+close(); without this, every click left
+        # a dead-loop session in the cache forever).
+        stale_keys = []
+        for k, s in _AIOHTTP_SESSIONS.items():
+            try:
+                if getattr(s, "_loop", None) is not None and s._loop.is_closed():
+                    stale_keys.append(k)
+            except Exception:
+                pass
+        for k in stale_keys:
+            _AIOHTTP_SESSIONS.pop(k, None)
+        existing = _AIOHTTP_SESSIONS.get(key)
+        if existing is not None and not existing.closed:
+            return existing
+        timeout = aiohttp.ClientTimeout(total=default_timeout_total)
+        session = aiohttp.ClientSession(timeout=timeout, headers=headers or {})
+        _AIOHTTP_SESSIONS[key] = session
+        return session
+
+
+async def _close_aiohttp_sessions():
+    """Close all cached sessions. Called from Tk WM_DELETE_WINDOW handler."""
+    with _AIOHTTP_SESSIONS_LOCK:
+        sessions = list(_AIOHTTP_SESSIONS.values())
+        _AIOHTTP_SESSIONS.clear()
+    for s in sessions:
+        if not s.closed:
+            try:
+                await s.close()
+            except Exception:
+                pass
+
 
 CONFIG_FILE = "poly_config_pro.json"
 LOG_FILE = "poly_mm_pro_max.log"
@@ -80,8 +133,15 @@ class PolyQuickTrader:
         self.latest_quick_markets: list[QuickMarket] = []
         self.latest_positions = []
         self.latest_signal = None
+        self.last_credential_error = None
         self.paper_results = []
         self.live_results = []
+        # Phase 10 account refresh state
+        self.account_last_refresh_ts: float = 0.0
+        self.account_last_balance_usdc = None
+        self.account_last_positions_value = None
+        self.account_last_positions_count: int = 0
+        self.account_last_error: str = ""
         self.live_auto_enabled = False
         self.live_auto_running = False
         self.live_auto_stop_requested = threading.Event()
@@ -116,6 +176,9 @@ class PolyQuickTrader:
         self.load_config_from_local()
         self.load_env_file()
         self.load_credentials_from_env()
+        # Phase 11: schedule daily report check (idempotent, fires once per UTC day).
+        self.root.after(5_000, self._daily_report_tick)
+        self.root.after(3_000, self._periodic_account_refresh_tick)
 
     def log_category_filter(self, record):
         record.category = getattr(self.log_context, "category", "manual")
@@ -308,6 +371,14 @@ class PolyQuickTrader:
             self.paper_tree.heading(col, text=title)
             self.paper_tree.column(col, width=paper_widths[col], anchor="center" if col != "slug" else "w")
         self.paper_tree.pack(fill="x", expand=False)
+
+        self.lbl_account_status = ttk.Label(
+            manual_tab,
+            text="账户状态加载中...",
+            foreground="#475569",
+            font=("Helvetica", 10),
+        )
+        self.lbl_account_status.pack(fill="x", padx=0, pady=(4, 0))
 
         pos_frame = ttk.LabelFrame(manual_tab, text=" 持仓与卖出 ", padding=10)
         pos_frame.pack(fill="x", padx=0, pady=5)
@@ -601,9 +672,22 @@ class PolyQuickTrader:
             temp_client = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=self.ent_priv_key.get().strip(), retry_on_error=True)
             creds = await asyncio.to_thread(temp_client.derive_api_key)
             self.logger.info("CLOB API 凭证派生成功。")
+            self.last_credential_error = None
             return creds
         except Exception as e:
-            self.logger.error("派生 CLOB API 凭证失败: %s", e)
+            # Surface the raw SDK error so users (esp. POLY_1271 deposit-wallet
+            # users hitting "signer != API KEY") have a clue without diving into
+            # the log file. Status bar is updated; the next order attempt will
+            # also see the recorded reason via self.last_credential_error.
+            err_text = f"{type(e).__name__}: {e}"
+            self.logger.error("派生 CLOB API 凭证失败: %s", err_text, exc_info=True)
+            self.last_credential_error = err_text
+            try:
+                self.root.after(0, lambda et=err_text: self.lbl_quick_signal.configure(
+                    text=f"⚠️ CLOB 凭证派生失败: {et[:120]}", foreground="#b91c1c"
+                ))
+            except Exception:
+                pass  # UI may not be initialized in non-GUI test paths
             return None
 
     def build_client(self, config, creds):
@@ -621,12 +705,12 @@ class PolyQuickTrader:
 
     async def fetch_json(self, url: str, params=None):
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12), headers={"User-Agent": "Mozilla/5.0"}) as session:
-                async with session.get(url, params=params) as response:
-                    if response.status != 200:
-                        self.logger.warning("GET %s 返回 HTTP %s", url, response.status)
-                        return None
-                    return await response.json()
+            session = _get_aiohttp_session()
+            async with session.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=12)) as response:
+                if response.status != 200:
+                    self.logger.warning("GET %s 返回 HTTP %s", url, response.status)
+                    return None
+                return await response.json()
         except Exception as e:
             self.logger.warning("GET %s 失败: %s", url, e)
             return None
@@ -654,12 +738,12 @@ class PolyQuickTrader:
     async def fetch_quick_btc_markets(self):
         url = f"{POLYMARKET_BASE_URL}/crypto/bitcoin"
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12), headers={"User-Agent": "Mozilla/5.0"}) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        self.logger.warning("BTC 页面返回 HTTP %s", response.status)
-                        return []
-                    html = await response.text()
+            session = _get_aiohttp_session()
+            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=12)) as response:
+                if response.status != 200:
+                    self.logger.warning("BTC 页面返回 HTTP %s", response.status)
+                    return []
+                html = await response.text()
         except Exception as e:
             self.logger.warning("读取 BTC 页面失败: %s", e)
             return []
@@ -820,18 +904,18 @@ class PolyQuickTrader:
         params = {"symbol": "BTCUSDT", "interval": "1m", "limit": str(lookback)}
         url = "https://api.binance.com/api/v3/klines"
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(url, params=params) as response:
-                    if response.status != 200:
-                        raise RuntimeError(f"Binance HTTP {response.status}")
-                    klines = await response.json()
+            session = _get_aiohttp_session()
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Binance HTTP {response.status}")
+                klines = await response.json()
         except Exception:
             url = "https://data-api.binance.vision/api/v3/klines"
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(url, params=params) as response:
-                    if response.status != 200:
-                        raise RuntimeError(f"Binance vision HTTP {response.status}")
-                    klines = await response.json()
+            session = _get_aiohttp_session()
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Binance vision HTTP {response.status}")
+                klines = await response.json()
 
         closes = [float(row[4]) for row in klines]
         if len(closes) < 30:
@@ -968,16 +1052,17 @@ class PolyQuickTrader:
         timeout = aiohttp.ClientTimeout(total=35, connect=10, sock_read=30)
         for attempt in range(1, 3):
             try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(
-                        MINIMAX_CHAT_URL,
-                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                        json=payload,
-                    ) as response:
-                        body = await response.text()
-                        if response.status != 200:
-                            raise RuntimeError(f"MiniMax HTTP {response.status}: {body[:500]}")
-                        return body
+                session = _get_aiohttp_session()
+                async with session.post(
+                    MINIMAX_CHAT_URL,
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=timeout,
+                ) as response:
+                    body = await response.text()
+                    if response.status != 200:
+                        raise RuntimeError(f"MiniMax HTTP {response.status}: {body[:500]}")
+                    return body
             except Exception as e:
                 last_error = e
                 self.logger.warning("MiniMax 请求第 %s 次失败: %s: %s", attempt, type(e).__name__, str(e) or repr(e))
@@ -1048,20 +1133,33 @@ class PolyQuickTrader:
         cleaned = re.sub(r"<think>.*?</think>", "", content or "", flags=re.S).strip()
         if not cleaned and content:
             cleaned = content.split("</think>", 1)[-1].strip() if "</think>" in content else content.strip()
-        match = re.search(r"\{.*\}", cleaned, flags=re.S)
-        if match:
-            cleaned = match.group(0)
+        # Prefer the LAST balanced {...} block — LLMs often emit reasoning
+        # chain + final JSON; greedy `\{.*\}` would over-capture both.
+        candidates = re.findall(r"\{[^{}]*\}", cleaned, flags=re.S)
+        if candidates:
+            cleaned = candidates[-1]
         if not cleaned.startswith("{"):
             raise ValueError("MiniMax 未返回 JSON 对象")
         parsed = json.loads(cleaned)
-        prob_up = min(max(float(parsed.get("prob_up", 0.5)), 0.0), 1.0)
+        prob_up = self._safe_prob(parsed.get("prob_up"), default=0.5)
+        prob_down = self._safe_prob(parsed.get("prob_down"), default=1.0 - prob_up)
         parsed["prob_up"] = prob_up
-        parsed["prob_down"] = min(max(float(parsed.get("prob_down", 1.0 - prob_up)), 0.0), 1.0)
+        parsed["prob_down"] = prob_down
         if parsed.get("action") not in {"BUY_UP", "BUY_DOWN", "NO_TRADE"}:
             parsed["action"] = "NO_TRADE"
         if parsed.get("confidence") not in {"LOW", "MEDIUM", "HIGH"}:
             parsed["confidence"] = "LOW"
         return parsed
+
+    @staticmethod
+    def _safe_prob(value, default):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return default
+        if v != v or v in (float("inf"), float("-inf")):
+            return default
+        return min(max(v, 0.0), 1.0)
 
     def render_btc_signal(self, signal):
         direction = "Up" if signal["prob_up"] >= 0.5 else "Down"
@@ -1299,12 +1397,12 @@ class PolyQuickTrader:
             last_error = None
             for url in urls:
                 try:
-                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-                        async with session.get(url, params=params) as response:
-                            if response.status != 200:
-                                raise RuntimeError(f"Binance kline HTTP {response.status}")
-                            data = await response.json()
-                            break
+                    session = _get_aiohttp_session()
+                    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                        if response.status != 200:
+                            raise RuntimeError(f"Binance kline HTTP {response.status}")
+                        data = await response.json()
+                        break
                 except Exception as e:
                     last_error = e
             if data is None:
@@ -1574,7 +1672,17 @@ class PolyQuickTrader:
         self.log_live(logging.WARNING, "%s 实盘下注序列: %s", profile["label"], " -> ".join(f"{x:.2f}" for x in stakes))
         seen_triggers = set()
         cycle_count = 0
+        heartbeat_interval_cycles = 10
+        last_heartbeat_cycle = 0
+        cycle_pnl_running = 0.0
         while not self.live_auto_stop_requested.is_set() and time.time() < deadline:
+            if cycle_count - last_heartbeat_cycle >= heartbeat_interval_cycles and cycle_count > 0:
+                remaining_hours = max(0.0, (deadline - time.time()) / 3600.0)
+                await self.push_to_server_chan(
+                    "Polymarket 反转实盘心跳",
+                    f"### Polymarket 反转实盘心跳\n\n- 策略: `{profile['label']}`\n- 已触发周期: `{cycle_count}`\n- 累计估算 pnl: `{cycle_pnl_running:+.2f}` USDC\n- 剩余小时: `{remaining_hours:.1f}`",
+                )
+                last_heartbeat_cycle = cycle_count
             rows = await self.fetch_btc_15m_klines(3)
             if len(rows) < 6:
                 await self.sleep_with_stop(60, self.live_auto_stop_requested)
@@ -1593,92 +1701,179 @@ class PolyQuickTrader:
             cycle_count += 1
             self.log_live(logging.WARNING, "触发%s实盘 #%s: 第3根=%s", profile["label"], cycle_count, self.fmt_kline_time(rows[i]))
             accumulated_loss = 0.0
+            cycle_open_positions: list[dict] = []
             for layer, stake in enumerate(stakes, start=1):
-                if self.live_auto_stop_requested.is_set() or time.time() >= deadline:
-                    break
-                trade_open = trigger_key + layer * 15 * 60 * 1000
-                wait_seconds = max(0, trade_open / 1000 - time.time())
-                if wait_seconds > 0:
-                    self.log_live(logging.INFO, "等待第 %s 单对应市场开盘，约 %.0f 秒", layer, wait_seconds)
-                    await self.sleep_with_stop(wait_seconds, self.live_auto_stop_requested)
-                if self.live_auto_stop_requested.is_set():
-                    break
-
-                target_slug = f"btc-updown-15m-{int(trade_open / 1000)}"
-                market = await self.fetch_market_by_slug(target_slug)
-                for _ in range(3):
-                    if market or self.live_auto_stop_requested.is_set():
+                try:
+                    if self.live_auto_stop_requested.is_set() or time.time() >= deadline:
                         break
-                    self.log_live(logging.INFO, "等待 Polymarket 创建目标市场: %s", target_slug)
-                    await self.sleep_with_stop(5, self.live_auto_stop_requested)
+                    trade_open = trigger_key + layer * 15 * 60 * 1000
+                    wait_seconds = max(0, trade_open / 1000 - time.time())
+                    if wait_seconds > 0:
+                        self.log_live(logging.INFO, "等待第 %s 单对应市场开盘，约 %.0f 秒", layer, wait_seconds)
+                        await self.sleep_with_stop(wait_seconds, self.live_auto_stop_requested)
+                    if self.live_auto_stop_requested.is_set():
+                        break
+
+                    target_slug = f"btc-updown-15m-{int(trade_open / 1000)}"
                     market = await self.fetch_market_by_slug(target_slug)
-                if not market:
-                    self.log_live(logging.WARNING, "未找到反转实盘目标市场，跳过本周期: %s", target_slug)
-                    break
-                token_id = getattr(market, profile["token_attr"])
-                book = await self.best_bid_ask_for_token(token_id)
-                ask = book["ask"] if book["ask"] is not None else getattr(market, profile["ask_attr"])
-                if ask > config["entry_price"]:
-                    self.log_live(logging.WARNING, "第 %s 单跳过: %s ask=%.4f 高于最高入场价 %.4f", layer, profile["direction"], ask, config["entry_price"])
-                    break
+                    for _ in range(3):
+                        if market or self.live_auto_stop_requested.is_set():
+                            break
+                        self.log_live(logging.INFO, "等待 Polymarket 创建目标市场: %s", target_slug)
+                        await self.sleep_with_stop(5, self.live_auto_stop_requested)
+                        market = await self.fetch_market_by_slug(target_slug)
+                    if not market:
+                        self.log_live(logging.WARNING, "未找到反转实盘目标市场，跳过本周期: %s", target_slug)
+                        if cycle_open_positions:
+                            await self._flatten_cycle_positions(cycle_open_positions, f"market_not_found:{target_slug}", cycle_count)
+                        break
+                    token_id = getattr(market, profile["token_attr"])
+                    book = await self.best_bid_ask_for_token(token_id)
+                    ask = book["ask"] if book["ask"] is not None else getattr(market, profile["ask_attr"])
+                    if ask > config["entry_price"]:
+                        self.log_live(logging.WARNING, "第 %s 单跳过: %s ask=%.4f 高于最高入场价 %.4f", layer, profile["direction"], ask, config["entry_price"])
+                        if cycle_open_positions:
+                            await self._flatten_cycle_positions(cycle_open_positions, f"ask_too_high:{ask:.4f}>{config['entry_price']:.4f}", cycle_count)
+                        break
 
-                buy_details = await self.buy_quick_market(market, profile["direction"], stake, config["entry_price"])
-                entry = float(buy_details["price"])
-                size = float(buy_details["size"])
-                row = {
-                    "round": f"R{cycle_count}-{layer}",
-                    "slug": market.slug,
-                    "status": "OPEN_REAL",
-                    "direction": profile["direction"],
-                    "entry": entry,
-                    "current": entry,
-                    "high": entry,
-                    "exit": None,
-                    "pnl": -accumulated_loss,
-                    "pnl_pct": 0.0,
-                    "entered": True,
-                    "result": f"OPEN_REAL | stake={stake:.2f}U | entry={entry:.4f}",
-                }
-                self.live_results.append(row)
-                self.root.after(0, self.render_live_results)
-                await self.push_to_server_chan(
-                    "Polymarket 反转实盘买入",
-                    f"### Polymarket 反转实盘买入\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 金额: `{stake:.2f}` USDC\n- 入场: `{entry:.4f}`\n- 数量: `{size:.4f}`",
-                )
-
-                wait_until_close = 0
-                if market.end_dt:
-                    wait_until_close = max(0, market.end_dt.timestamp() - time.time() + 2)
-                if wait_until_close > 0:
-                    self.log_live(logging.INFO, "等待第 %s 单结算，约 %.0f 秒", layer, wait_until_close)
-                    await self.sleep_with_stop(wait_until_close)
-                latest_rows = await self.fetch_btc_15m_klines(2)
-                trade_rows = [row_data for row_data in latest_rows if int(row_data[0]) == int(trade_open)]
-                if trade_rows:
-                    win = self.kline_color(trade_rows[0]) == profile["win_color"]
-                else:
-                    latest_market = await self.fetch_market_by_slug(market.slug) or market
-                    win = bool(latest_market.ended and getattr(latest_market, profile["settlement_bid_attr"]) > 0.9)
-                if win:
-                    pnl = (1.0 - entry) * size - accumulated_loss
-                    row.update({"status": "REVERSAL_REAL_WIN", "current": 1.0, "high": 1.0, "exit": 1.0, "pnl": pnl, "pnl_pct": pnl / stake * 100 if stake else 0.0})
+                    buy_details = await self.buy_quick_market(market, profile["direction"], stake, config["entry_price"])
+                    entry = float(buy_details["price"])
+                    size = float(buy_details["size"])
+                    fill_verified = bool(buy_details.get("fill_verified"))
+                    fill_status = buy_details.get("fill_status", "unknown")
+                    cycle_open_positions.append({
+                        "layer": layer,
+                        "token_id": buy_details["token_id"],
+                        "tick_size": str(buy_details.get("tick_size") or "0.01"),
+                        "fill_size": float(buy_details["size"]),
+                        "entry": float(buy_details["price"]),
+                    })
+                    if not fill_verified:
+                        self.log_live(logging.WARNING, "第 %s 单成交价未验证（fill_status=%s），后续 PnL 使用 limit 估算", layer, fill_status)
+                    row = {
+                        "round": f"R{cycle_count}-{layer}",
+                        "slug": market.slug,
+                        "status": "OPEN_REAL",
+                        "direction": profile["direction"],
+                        "entry": entry,
+                        "current": entry,
+                        "high": entry,
+                        "exit": None,
+                        "pnl": -accumulated_loss,
+                        "pnl_pct": 0.0,
+                        "entered": True,
+                        "result": f"OPEN_REAL | stake={stake:.2f}U | entry={entry:.4f} | verified={fill_verified}",
+                    }
+                    self.live_results.append(row)
                     self.root.after(0, self.render_live_results)
-                    self.log_live(logging.WARNING, "%s 实盘第 %s 单胜: pnl≈%+.2fU", profile["label"], layer, pnl)
+                    await self.push_to_server_chan(
+                        "Polymarket 反转实盘买入",
+                        f"### Polymarket 反转实盘买入\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 金额: `{stake:.2f}` USDC\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 数量: `{size:.4f}`",
+                    )
+
+                    wait_until_close = 0
+                    if market.end_dt:
+                        wait_until_close = max(0, market.end_dt.timestamp() - time.time() + 2)
+                    if wait_until_close > 0:
+                        self.log_live(logging.INFO, "等待第 %s 单结算，约 %.0f 秒", layer, wait_until_close)
+                        await self.sleep_with_stop(wait_until_close)
+                    # market end_dt + 5min grace as upper bound for settlement detection;
+                    # fall back to 30 min from now if end_dt missing.
+                    settle_deadline = (market.end_dt.timestamp() + 300) if market.end_dt else (time.time() + 1800)
+                    token_id_settled = getattr(market, profile["token_attr"])
+                    outcome = await self._settle_from_positions(token_id_settled, settle_deadline, self.live_auto_stop_requested)
+                    if outcome == "win":
+                        pnl = (1.0 - entry) * size - accumulated_loss
+                        row.update({"status": "REVERSAL_REAL_WIN", "current": 1.0, "high": 1.0, "exit": 1.0, "pnl": pnl, "pnl_pct": pnl / stake * 100 if stake else 0.0})
+                        self.root.after(0, self.render_live_results)
+                        self.log_live(logging.WARNING, "%s 实盘第 %s 单胜 (data-api redeemable=True): pnl≈%+.2fU", profile["label"], layer, pnl)
+                        await self.push_to_server_chan(
+                            "Polymarket 反转实盘结果",
+                            f"### Polymarket 反转实盘结果\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 结果: `WIN`\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 结算: `data-api redeemable`\n- 本行盈亏估算: `{pnl:+.2f}` USDC",
+                        )
+                        self._append_trade_journal({
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "strategy": profile["label"], "cycle": cycle_count, "layer": layer,
+                            "market_slug": market.slug, "direction": profile["direction"],
+                            "stake_usdc": f"{stake:.4f}", "requested_price": f"{config['entry_price']:.4f}",
+                            "fill_price": f"{entry:.4f}", "fill_size": f"{size:.6f}",
+                            "fill_verified": str(fill_verified), "outcome": outcome,
+                            "pnl_estimate": f"{pnl:+.4f}", "accumulated_loss": f"{accumulated_loss:.4f}",
+                        })
+                        # WIN path: `pnl` already subtracted accumulated_loss for this cycle, but
+                        # the prior LOSS layers already added their own -loss to cycle_pnl_running.
+                        # Adding `pnl` directly here would double-count earlier losses. Restore the
+                        # accumulated_loss term so the running total is the sum of per-layer outcomes.
+                        cycle_pnl_running += pnl + accumulated_loss
+                        cycle_open_positions = [p for p in cycle_open_positions if p["layer"] != layer]
+                        break
+                    if outcome == "pending_timeout":
+                        self.log_live(logging.ERROR, "%s 实盘第 %s 单结算异常 (deadline 超出，需人工介入)", profile["label"], layer)
+                        await self.push_to_server_chan(
+                            "Polymarket 反转实盘 ⚠️ 结算异常",
+                            f"### ⚠️ 反转实盘结算异常\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 市场: `{market.slug}`\n- token: `{token_id_settled[:12]}...`\n- 入场: `{entry:.4f}`\n- 仓位结算状态超 deadline 未确定，请去 polymarket.com/portfolio 人工核对",
+                        )
+                        self._append_trade_journal({
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "strategy": profile["label"], "cycle": cycle_count, "layer": layer,
+                            "market_slug": market.slug, "direction": profile["direction"],
+                            "stake_usdc": f"{stake:.4f}", "requested_price": f"{config['entry_price']:.4f}",
+                            "fill_price": f"{entry:.4f}", "fill_size": f"{size:.6f}",
+                            "fill_verified": str(fill_verified), "outcome": outcome,
+                            "pnl_estimate": "0.0000", "accumulated_loss": f"{accumulated_loss:.4f}",
+                        })
+                        if cycle_open_positions:
+                            await self._flatten_cycle_positions(cycle_open_positions, f"pending_timeout:layer{layer}", cycle_count)
+                        return f"已停止 (结算异常 + 回滚)，触发周期={cycle_count}"
+                    # outcome == "loss"
+                    loss = entry * size
+                    accumulated_loss += loss
+                    pnl = -loss
+                    row.update({"status": "REVERSAL_REAL_LOSS" if layer == len(stakes) else "REVERSAL_REAL_NEXT", "current": 0.0, "high": row.get("high", entry), "exit": 0.0, "pnl": pnl, "pnl_pct": pnl / stake * 100 if stake else 0.0})
+                    self.root.after(0, self.render_live_results)
+                    self.log_live(logging.WARNING, "%s 实盘第 %s 单负 (data-api 仓位归零): loss≈%.2fU", profile["label"], layer, loss)
                     await self.push_to_server_chan(
                         "Polymarket 反转实盘结果",
-                        f"### Polymarket 反转实盘结果\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 结果: `WIN`\n- 入场: `{entry:.4f}`\n- 结算: `1.0000`\n- 本行盈亏估算: `{pnl:+.2f}` USDC",
+                        f"### Polymarket 反转实盘结果\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 结果: `LOSS`\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 结算: `data-api 仓位归零`\n- 本行盈亏估算: `{pnl:+.2f}` USDC",
                     )
-                    break
-                loss = entry * size
-                accumulated_loss += loss
-                pnl = -loss
-                row.update({"status": "REVERSAL_REAL_LOSS" if layer == len(stakes) else "REVERSAL_REAL_NEXT", "current": 0.0, "high": row.get("high", entry), "exit": 0.0, "pnl": pnl, "pnl_pct": pnl / stake * 100 if stake else 0.0})
-                self.root.after(0, self.render_live_results)
-                self.log_live(logging.WARNING, "%s 实盘第 %s 单负: loss≈%.2fU", profile["label"], layer, loss)
-                await self.push_to_server_chan(
-                    "Polymarket 反转实盘结果",
-                    f"### Polymarket 反转实盘结果\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 结果: `LOSS`\n- 入场: `{entry:.4f}`\n- 结算: `0.0000`\n- 本行盈亏估算: `{pnl:+.2f}` USDC",
-                )
+                    self._append_trade_journal({
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "strategy": profile["label"], "cycle": cycle_count, "layer": layer,
+                        "market_slug": market.slug, "direction": profile["direction"],
+                        "stake_usdc": f"{stake:.4f}", "requested_price": f"{config['entry_price']:.4f}",
+                        "fill_price": f"{entry:.4f}", "fill_size": f"{size:.6f}",
+                        "fill_verified": str(fill_verified), "outcome": outcome,
+                        "pnl_estimate": f"{pnl:+.4f}", "accumulated_loss": f"{accumulated_loss:.4f}",
+                    })
+                    cycle_pnl_running += pnl
+                    cycle_open_positions = [p for p in cycle_open_positions if p["layer"] != layer]
+                except Exception as exc:
+                    self.log_live(logging.ERROR, "反转实盘 layer %s 异常中断: %s", layer, exc)
+                    # Phase 2 retry-post timeout (RuntimeError) can raise AFTER
+                    # the exchange actually accepted the order. cycle_open_positions
+                    # only has confirmed layers — probe data-api for THIS layer's
+                    # token to detect on-chain orphan and include it in flatten.
+                    pending_token_id = locals().get("token_id")
+                    if pending_token_id and not any(p.get("layer") == layer for p in cycle_open_positions):
+                        try:
+                            probe_positions = await self._fetch_positions_raw()
+                            probe_match = next((p for p in probe_positions if p.get("asset") == pending_token_id), None)
+                            if probe_match and self._float_or_zero(probe_match.get("size")) > 0.000001:
+                                pending_market = locals().get("market")
+                                pending_tick = str(getattr(pending_market, "tick_size", None) or "0.01") if pending_market else "0.01"
+                                cycle_open_positions.append({
+                                    "layer": layer,
+                                    "token_id": pending_token_id,
+                                    "tick_size": pending_tick,
+                                    "fill_size": self._float_or_zero(probe_match.get("size")),
+                                    "entry": self._float_or_zero(probe_match.get("avgPrice")),
+                                })
+                                self.log_live(logging.WARNING, "layer %s 异常时仓位仍在 size=%.4f，加入回滚", layer, self._float_or_zero(probe_match.get("size")))
+                        except Exception as probe_exc:
+                            self.log_live(logging.ERROR, "layer %s 异常后查仓位失败: %s — flatten 可能不完整", layer, probe_exc)
+                    if cycle_open_positions:
+                        await self._flatten_cycle_positions(cycle_open_positions, f"layer_exception:{type(exc).__name__}:{str(exc)[:120]}", cycle_count)
+                    raise
                 if self.live_auto_stop_requested.is_set():
                     break
             await self.sleep_with_stop(60, self.live_auto_stop_requested)
@@ -1768,20 +1963,20 @@ class PolyQuickTrader:
         url = "https://api.binance.com/api/v3/ticker/price"
         params = {"symbol": "BTCUSDT"}
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(url, params=params) as response:
-                    if response.status != 200:
-                        raise RuntimeError(f"Binance ticker HTTP {response.status}")
-                    data = await response.json()
-                    return float(data["price"])
+            session = _get_aiohttp_session()
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Binance ticker HTTP {response.status}")
+                data = await response.json()
+                return float(data["price"])
         except Exception:
             url = "https://data-api.binance.vision/api/v3/ticker/price"
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(url, params=params) as response:
-                    if response.status != 200:
-                        raise RuntimeError(f"Binance vision ticker HTTP {response.status}")
-                    data = await response.json()
-                    return float(data["price"])
+            session = _get_aiohttp_session()
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Binance vision ticker HTTP {response.status}")
+                data = await response.json()
+                return float(data["price"])
 
     def buy_selected_quick_market(self, direction: str):
         market = self.selected_quick_market()
@@ -1842,20 +2037,20 @@ class PolyQuickTrader:
         if size < 5.0:
             raise RuntimeError(f"买入金额太小，按价格 {price:.4f} 至少需要 {price * 5:.2f} USDC 才满足 5 份最小下单量")
         self.logger.info("提交买入订单: %s price=%.4f size=%.4f tick=%s", direction, price, size, tick_size or market.tick_size)
-        resp = await asyncio.wait_for(
-            asyncio.to_thread(
-                client.create_and_post_order,
-                order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.BUY),
-                options=PartialCreateOrderOptions(tick_size=tick_size or market.tick_size),
-                order_type=OrderType.GTC,
-                post_only=False,
-            ),
-            timeout=25,
+        signed = await asyncio.to_thread(
+            client.create_order,
+            order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.BUY),
+            options=PartialCreateOrderOptions(tick_size=tick_size or market.tick_size),
         )
-        if isinstance(resp, dict) and resp.get("success") is False:
-            raise RuntimeError(f"交易所拒绝订单: {resp}")
-        await self.push_trade_result("快速买入", market.question, direction, size, price, resp, market_slug=market.slug)
-        return {"response": resp, "token_id": token_id, "price": price, "size": size, "tick_size": tick_size or market.tick_size}
+        resp = await self._post_signed_order_with_retry(client, signed, order_type=OrderType.GTC, post_only=False)
+        self._assert_order_response_ok(resp, action_name="快速买入")
+        fill = self._extract_fill(resp, limit_price=price, limit_size=size)
+        if fill["verified"]:
+            self.logger.info("成交确认: limit=%.4f×%.4f → fill=%.4f×%.4f status=%s", price, size, fill["fill_price"], fill["fill_size"], fill["status"])
+        else:
+            self.logger.warning("未拿到真实成交数据，仍用 limit 估算: status=%s resp_keys=%s", fill["status"], list(resp.keys()) if isinstance(resp, dict) else type(resp).__name__)
+        await self.push_trade_result("快速买入", market.question, direction, fill["fill_size"], fill["fill_price"], resp, market_slug=market.slug)
+        return {"response": resp, "token_id": token_id, "price": fill["fill_price"], "size": fill["fill_size"], "tick_size": tick_size or market.tick_size, "fill_status": fill["status"], "fill_verified": fill["verified"]}
 
     async def best_ask_for_token(self, client, token_id: str):
         orderbook = await asyncio.wait_for(asyncio.to_thread(client.get_order_book, token_id), timeout=15)
@@ -1894,18 +2089,13 @@ class PolyQuickTrader:
         client = self.build_client(config, creds)
         price = self.clamp_price(price, tick_size)
         self.logger.warning("提交实盘自动卖出订单: token=%s price=%.4f size=%.4f tick=%s", token_id[:12], price, size, tick_size)
-        resp = await asyncio.wait_for(
-            asyncio.to_thread(
-                client.create_and_post_order,
-                order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.SELL),
-                options=PartialCreateOrderOptions(tick_size=tick_size),
-                order_type=OrderType.GTC,
-                post_only=False,
-            ),
-            timeout=25,
+        signed = await asyncio.to_thread(
+            client.create_order,
+            order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.SELL),
+            options=PartialCreateOrderOptions(tick_size=tick_size),
         )
-        if isinstance(resp, dict) and resp.get("success") is False:
-            raise RuntimeError(f"交易所拒绝卖出订单: {resp}")
+        resp = await self._post_signed_order_with_retry(client, signed, order_type=OrderType.GTC, post_only=False)
+        self._assert_order_response_ok(resp, action_name="限价卖出")
         return resp
 
     async def fetch_positions(self):
@@ -1920,16 +2110,555 @@ class PolyQuickTrader:
             "sortDirection": "DESC",
         }
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12), headers={"User-Agent": "Mozilla/5.0"}) as session:
-                async with session.get("https://data-api.polymarket.com/positions", params=params) as response:
-                    if response.status != 200:
-                        self.logger.warning("持仓接口返回 HTTP %s", response.status)
-                        return []
-                    data = await response.json()
+            session = _get_aiohttp_session()
+            async with session.get("https://data-api.polymarket.com/positions", params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=12)) as response:
+                if response.status != 200:
+                    self.logger.warning("持仓接口返回 HTTP %s", response.status)
+                    return []
+                data = await response.json()
         except Exception as e:
             self.logger.warning("读取持仓失败: %s", e)
             return []
         return data if isinstance(data, list) else []
+
+    async def _fetch_positions_value(self):
+        """Return total value of user's positions (USDC) via data-api /value.
+
+        Returns None on failure (caller preserves last known value).
+        Returns 0.0 when the user has no positions (empty array response).
+        """
+        user = self.ent_funder.get().strip()
+        if not user:
+            return None
+        try:
+            session = _get_aiohttp_session()
+            async with session.get(
+                "https://data-api.polymarket.com/value",
+                params={"user": user},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status != 200:
+                    self.logger.warning("positions value HTTP %s", response.status)
+                    return None
+                data = await response.json()
+        except Exception as e:
+            self.logger.warning("positions value 读取失败: %s", e)
+            return None
+        if not isinstance(data, list) or not data:
+            return 0.0
+        try:
+            return float(data[0].get("value", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+
+    POLYGON_USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    POLYGON_RPC_URL = "https://polygon-rpc.com"
+
+    async def _fetch_usdc_balance_onchain(self):
+        """Return funder address's free USDC balance on Polygon via JSON-RPC.
+
+        Uses ERC20 balanceOf selector 0x70a08231. USDC has 6 decimals.
+        Returns None on failure (caller preserves last known value).
+        """
+        user = self.ent_funder.get().strip()
+        if not user or not user.startswith("0x") or len(user) != 42:
+            return None
+        addr_clean = user[2:].lower()
+        data_field = "0x70a08231" + "0" * 24 + addr_clean
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [
+                {"to": self.POLYGON_USDC_CONTRACT, "data": data_field},
+                "latest",
+            ],
+            "id": 1,
+        }
+        try:
+            session = _get_aiohttp_session()
+            async with session.post(
+                self.POLYGON_RPC_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status != 200:
+                    self.logger.warning("USDC balance RPC HTTP %s", response.status)
+                    return None
+                resp_json = await response.json()
+        except Exception as e:
+            self.logger.warning("USDC balance RPC 读取失败: %s", e)
+            return None
+        result_hex = resp_json.get("result")
+        if not isinstance(result_hex, str) or not result_hex.startswith("0x"):
+            self.logger.warning("USDC balance RPC 响应缺 result: %s", resp_json)
+            return None
+        try:
+            return int(result_hex, 16) / 1_000_000.0
+        except ValueError:
+            return None
+
+    async def _fetch_positions_raw(self):
+        """
+        Like fetch_positions() but raises on HTTP/transport error instead
+        of silently returning []. Settlement-critical callers MUST use this
+        so a network failure is never confused with "user has no positions".
+        """
+        user = self.ent_funder.get().strip()
+        if not user:
+            return []
+        params = {
+            "user": user,
+            "limit": "50",
+            "sizeThreshold": "0",
+            "sortBy": "CURRENT",
+            "sortDirection": "DESC",
+        }
+        session = _get_aiohttp_session()
+        async with session.get("https://data-api.polymarket.com/positions", params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=12)) as response:
+            if response.status != 200:
+                raise RuntimeError(f"positions HTTP {response.status}")
+            data = await response.json()
+        return data if isinstance(data, list) else []
+
+    async def _settle_from_positions(self, token_id: str, deadline_ts: float, stop_event=None):
+        """
+        Poll data-api /positions to determine WIN/LOSS for a token_id.
+        Returns: 'win' | 'loss' | 'pending_timeout'.
+
+        Per data-api OpenAPI (Position.redeemable):
+          - asset == token_id + size > 0 + redeemable == True  → WIN
+          - asset == token_id + size > 0 + redeemable == False → still settling, retry
+          - asset not in positions list                         → LOSS (loser side burned)
+
+        Uses _fetch_positions_raw so a transient HTTP/network failure is
+        retried (does NOT advance the absent-state machine that would
+        otherwise misfire as LOSS — protects against double-failure
+        misclassification feeding bad data to martingale.)
+
+        Backoff: exponential 5s → 60s cap. Aborts if stop_event set or time > deadline_ts.
+        """
+        backoff = 5.0
+        last_state = None
+        while time.time() < deadline_ts:
+            if stop_event is not None and stop_event.is_set():
+                return "pending_timeout"
+            try:
+                positions = await self._fetch_positions_raw()
+            except Exception as e:
+                self.logger.warning("settle 阶段 positions fetch 失败 (重试): %s", e)
+                # V8 final-review patch: reset absent-streak so a transient
+                # HTTP failure between two successful absent polls cannot
+                # collapse into a false LOSS. We require two CONSECUTIVE
+                # successful absent polls, not just two-total.
+                last_state = None
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 1.5, 60.0)
+                continue
+            match = next((p for p in positions if p.get("asset") == token_id), None)
+            if match is None:
+                # Position not present → loser side burned by resolution.
+                # Guard against transient empty-list (fetch failure) by requiring
+                # this state to persist one cycle.
+                if last_state == "absent":
+                    return "loss"
+                last_state = "absent"
+            else:
+                size = self._float_or_zero(match.get("size"))
+                if size <= 0.000001:
+                    if last_state == "absent":
+                        return "loss"
+                    last_state = "absent"
+                elif match.get("redeemable") is True:
+                    return "win"
+                else:
+                    last_state = "pending"
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.5, 60.0)
+        return "pending_timeout"
+
+    async def _flatten_cycle_positions(self, open_positions: list[dict], reason: str, cycle_count: int):
+        """
+        Best-effort flatten of every position opened in the current reversal cycle
+        that has not yet resolved. Used when the layer loop aborts mid-cycle so
+        the user is not left holding wrong-direction bags.
+
+        For each open position: read best_bid_ask_for_token; pick a marketable
+        sell price (0.95 * best_bid for slippage tolerance), floored at tick_size
+        to avoid clamp-to-zero on thin books; submit sell_token_limit. Log each
+        step. Push one Server酱 critical summary at the end.
+
+        Known limitation: sell_token_limit still uses Phase 2's retry-post path,
+        so a timeout-then-double race is still possible on the rollback sells
+        themselves. The Server酱 push tells the user to reconcile manually at
+        polymarket.com/portfolio as the last line of defense.
+        """
+        results = []
+        for pos in open_positions:
+            token_id = pos["token_id"]
+            try:
+                book = await self.best_bid_ask_for_token(token_id)
+                bid = book.get("bid")
+                tick_size = book.get("tick_size") or pos["tick_size"]
+                tick_value = float(tick_size) if tick_size else 0.01
+                if bid is None or bid <= 0:
+                    sell_price = self.clamp_price(tick_value, tick_size)
+                    self.log_live(logging.WARNING, "rollback layer %s 无 bid，使用最低价 %.4f", pos["layer"], sell_price)
+                else:
+                    raw_price = max(bid * 0.95, tick_value)
+                    sell_price = self.clamp_price(raw_price, tick_size)
+                resp = await self.sell_token_limit(token_id, pos["fill_size"], sell_price, tick_size)
+                self.log_live(logging.WARNING, "rollback layer %s 卖出: size=%.4f price=%.4f resp=%s", pos["layer"], pos["fill_size"], sell_price, str(resp)[:120])
+                results.append({"layer": pos["layer"], "ok": True, "price": sell_price, "size": pos["fill_size"]})
+            except Exception as e:
+                self.log_live(logging.ERROR, "rollback layer %s 卖出失败: %s", pos["layer"], e)
+                results.append({"layer": pos["layer"], "ok": False, "error": str(e)[:200], "token_id": token_id[:12]})
+        try:
+            lines = []
+            for r in results:
+                if r["ok"]:
+                    lines.append(f"- layer {r['layer']}: OK {r['price']:.4f} x {r['size']:.4f}")
+                else:
+                    lines.append(f"- layer {r['layer']}: FAIL {r.get('error', '')}")
+            await self.push_to_server_chan(
+                "Polymarket 反转实盘 ⚠️ 周期回滚",
+                f"### ⚠️ 反转实盘周期中断回滚\n\n- 周期: `{cycle_count}`\n- 原因: `{reason}`\n- 回滚结果:\n" + "\n".join(lines) + "\n\n请去 polymarket.com/portfolio 人工对账。",
+            )
+        except Exception as e:
+            self.logger.error("rollback Server酱 推送失败: %s", e)
+        return results
+
+    async def _post_signed_order_with_retry(
+        self,
+        client,
+        signed_order,
+        order_type=OrderType.GTC,
+        post_only: bool = False,
+        max_attempts: int = 2,
+        per_attempt_timeout: float = 25.0,
+    ):
+        """
+        Post a pre-signed CLOB order with retry-safe semantics.
+
+        Per Phase 2 research (cycles/_phase2-research.md): SignedOrderV2 is
+        byte-level frozen (salt + timestamp + EIP-712 signature all set in
+        create_order). Re-posting the same instance produces byte-identical
+        request bodies → identical orderID (order hash) → server dedup.
+        py_clob_client_v2's own retry_on_error path uses this assumption.
+
+        On per-attempt TimeoutError we retry the SAME signed_order. If all
+        attempts time out, raise a RuntimeError indicating user should
+        reconcile at polymarket.com/portfolio (the order may have landed).
+
+        WARNING: server-side dedup is inferred, not OpenAPI-documented.
+        Phase 2 commit MUST be followed by a live spike (see handoff).
+        """
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(client.post_order, signed_order, order_type, post_only),
+                    timeout=per_attempt_timeout,
+                )
+                if attempt > 1:
+                    self.logger.info("post_order 重试 attempt=%s 成功", attempt)
+                return resp
+            except asyncio.TimeoutError as e:
+                last_exc = e
+                self.logger.warning(
+                    "post_order 超时 attempt=%s/%s — 用同一 signed_order 重试 (server 应按 orderID 去重)",
+                    attempt, max_attempts,
+                )
+                continue
+        raise RuntimeError(
+            f"post_order 重试 {max_attempts} 次仍超时；订单可能已成交，请去 polymarket.com/portfolio 对账"
+        ) from last_exc
+
+    @staticmethod
+    def _append_trade_journal(row: dict, path: str = "trade_journal.csv"):
+        """
+        Append a single trade settlement row to CSV at `path`.
+        Creates the file with header on first write. Best-effort: caller's
+        flow must not depend on this succeeding (logs warning on error).
+
+        Required row keys:
+          ts, strategy, cycle, layer, market_slug, direction,
+          stake_usdc, requested_price, fill_price, fill_size,
+          fill_verified, outcome, pnl_estimate, accumulated_loss
+        """
+        import csv
+        fieldnames = [
+            "ts", "strategy", "cycle", "layer", "market_slug", "direction",
+            "stake_usdc", "requested_price", "fill_price", "fill_size",
+            "fill_verified", "outcome", "pnl_estimate", "accumulated_loss",
+        ]
+        try:
+            need_header = not os.path.exists(path) or os.path.getsize(path) == 0
+            with open(path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                if need_header:
+                    writer.writeheader()
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+        except OSError as e:
+            logging.getLogger("PolyQuickTrader").warning("trade journal append 失败: %s", e)
+
+    @staticmethod
+    def _aggregate_daily_journal(rows: list[dict], target_date_utc: str) -> dict:
+        """Pure aggregator over trade_journal rows (csv.DictReader-parsed).
+        target_date_utc: 'YYYY-MM-DD'. Counts cycles via (strategy,cycle) tuple."""
+        same_day = [r for r in rows if r.get("ts", "")[:10] == target_date_utc]
+        cycles = {(r["strategy"], r["cycle"]) for r in same_day}
+        wins = [r for r in same_day if r.get("outcome") == "win"]
+        losses = [r for r in same_day if r.get("outcome") == "loss"]
+        timeouts = [r for r in same_day if r.get("outcome") == "pending_timeout"]
+        unverified = [r for r in same_day if r.get("fill_verified") == "False"]
+        pnl_sum = 0.0
+        # Per-cycle aggregation per Final Codex P2 BLOCKER: trade_journal
+        # writes one row per layer. The WIN layer's pnl_estimate already
+        # subtracted accumulated_loss (Phase 9 invariant), so simply
+        # summing every row across a lose-then-win cycle counted prior
+        # losses twice. Aggregate per (strategy, cycle): if any row is WIN
+        # its pnl IS the net; otherwise sum all rows (LOSS-only / timeout-
+        # only cycles have no double-count).
+        cycles_for_pnl: dict[tuple, list[dict]] = {}
+        for r in same_day:
+            cycles_for_pnl.setdefault((r["strategy"], r["cycle"]), []).append(r)
+        for cycle_rows in cycles_for_pnl.values():
+            win_row = next((r for r in cycle_rows if r.get("outcome") == "win"), None)
+            if win_row is not None:
+                contributing_rows = [win_row]
+            else:
+                contributing_rows = cycle_rows
+            for r in contributing_rows:
+                try:
+                    v = float(r.get("pnl_estimate", "0") or "0")
+                except (TypeError, ValueError):
+                    continue
+                # V3 guard (Phase 11 Codex warn): NaN/Inf in pnl_estimate would
+                # poison the entire daily P&L sum (NaN + anything == NaN).
+                if v != v or v in (float("inf"), float("-inf")):
+                    continue
+                pnl_sum += v
+        # Max consecutive loss layers within any single (strategy,cycle).
+        max_consec_loss = 0
+        per_cycle: dict[tuple, list[dict]] = {}
+        for r in same_day:
+            per_cycle.setdefault((r["strategy"], r["cycle"]), []).append(r)
+        for rs in per_cycle.values():
+            try:
+                rs_sorted = sorted(rs, key=lambda x: int(x.get("layer", 0)))
+            except (TypeError, ValueError):
+                rs_sorted = rs
+            run = best = 0
+            for r in rs_sorted:
+                if r.get("outcome") == "loss":
+                    run += 1
+                    best = max(best, run)
+                else:
+                    run = 0
+            max_consec_loss = max(max_consec_loss, best)
+        return {
+            "date": target_date_utc,
+            "total_rows": len(same_day),
+            "cycle_count": len(cycles),
+            "win_count": len(wins),
+            "loss_count": len(losses),
+            "pending_timeout_count": len(timeouts),
+            "unverified_fill_count": len(unverified),
+            "pnl_estimate_sum": pnl_sum,
+            "max_consecutive_loss_layers": max_consec_loss,
+            "anomaly_count": len(timeouts) + len(unverified),
+        }
+
+    @staticmethod
+    def _render_daily_report_md(stats: dict) -> str:
+        lines = [
+            f"# Polymarket BTC 反转实盘日报 — {stats['date']} (UTC)",
+            "",
+            f"- 触发周期数: **{stats['cycle_count']}**",
+            f"- 总成交行数: {stats['total_rows']}",
+            f"- WIN: {stats['win_count']}",
+            f"- LOSS: {stats['loss_count']}",
+            f"- 估算 P&L 累计: **{stats['pnl_estimate_sum']:+.4f} USDC** "
+            "（基于 trade_journal.csv 的 pnl_estimate，仍是 model 估算）",
+            f"- 最大单 cycle 连亏层数: {stats['max_consecutive_loss_layers']}",
+            "",
+            "## 异常",
+            f"- pending_timeout: {stats['pending_timeout_count']}",
+            f"- fill_verified=False: {stats['unverified_fill_count']}",
+            f"- 异常总计: **{stats['anomaly_count']}**",
+            "",
+            "链上真实余额变化以 polymarket.com/portfolio 为准。",
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _daily_report_tick(self):
+        """Tk root.after callback. Checks whether a new UTC day has rolled
+        over since the last report; if so, spawns a worker thread to
+        generate + push report for yesterday. Re-schedules itself."""
+        try:
+            # V3 guard (Phase 11 Codex warn): if a previous worker is still
+            # running (slow journal read / Server酱 push), the 60s tick must
+            # NOT spawn a second concurrent worker — that would duplicate the
+            # report + race the marker write.
+            if getattr(self, "_daily_report_running", False):
+                return
+            today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            last_path = os.path.join("reports", ".daily_report_last.txt")
+            last_reported = ""
+            if os.path.exists(last_path):
+                try:
+                    with open(last_path, "r", encoding="utf-8") as f:
+                        last_reported = f.read().strip()
+                except OSError:
+                    pass
+            # Report for "yesterday" (everything earlier than today_utc).
+            yesterday = (datetime.now(timezone.utc).date() -
+                         __import__("datetime").timedelta(days=1)).strftime("%Y-%m-%d")
+            if last_reported != yesterday:
+                self._daily_report_running = True
+                def worker(day=yesterday, last=last_path):
+                    try:
+                        loop = asyncio.new_event_loop()
+                        try:
+                            loop.run_until_complete(self._generate_and_push_daily_report(day, last))
+                        finally:
+                            loop.close()
+                    except Exception as e:
+                        self.logger.warning("日报生成异常: %s", e)
+                    finally:
+                        self._daily_report_running = False
+                threading.Thread(target=worker, daemon=True).start()
+        finally:
+            self.root.after(60_000, self._daily_report_tick)
+
+    def _periodic_account_refresh_tick(self):
+        """Tk root.after callback. Spawns worker thread that fetches
+        positions + positions value + free USDC balance, updates
+        lbl_account_status, then re-schedules itself."""
+        try:
+            if getattr(self, "_account_refresh_running", False):
+                return
+            self._account_refresh_running = True
+
+            def worker():
+                try:
+                    loop = asyncio.new_event_loop()
+                    try:
+                        positions, pos_value, balance = loop.run_until_complete(
+                            self._gather_account_refresh()
+                        )
+                    finally:
+                        loop.close()
+                    self.root.after(0, lambda: self._apply_account_refresh(
+                        positions, pos_value, balance
+                    ))
+                except Exception as e:
+                    self.logger.warning("account refresh worker 异常: %s", e)
+                    self.account_last_error = str(e)[:120]
+                finally:
+                    self._account_refresh_running = False
+
+            threading.Thread(target=worker, daemon=True).start()
+        finally:
+            self.root.after(60_000, self._periodic_account_refresh_tick)
+
+    async def _gather_account_refresh(self):
+        positions_task = asyncio.create_task(self.fetch_positions())
+        value_task = asyncio.create_task(self._fetch_positions_value())
+        balance_task = asyncio.create_task(self._fetch_usdc_balance_onchain())
+        positions = await positions_task
+        pos_value = await value_task
+        balance = await balance_task
+        return positions, pos_value, balance
+
+    def _apply_account_refresh(self, positions, pos_value, balance):
+        now = time.time()
+        # Phase 10 Codex blocker: only update refresh_ts when at least one
+        # explicit data source succeeded. fetch_positions() returns []
+        # ambiguously (could be HTTP failure or genuinely-no-positions), so
+        # use pos_value/balance None-vs-not-None as the unambiguous signal.
+        # If both are None, the network is bad — keep prior refresh_ts so
+        # _render_account_status_label produces the stale (orange) marker.
+        any_success = (pos_value is not None) or (balance is not None)
+        if positions is not None and any_success:
+            # Only trust the positions list if at least one other source
+            # also returned cleanly — else we may have an empty list from
+            # a silent HTTP failure inside fetch_positions().
+            self.latest_positions = positions
+            self.account_last_positions_count = sum(
+                1 for p in positions if self._float_or_zero(p.get("size")) > 0.000001
+            )
+            self.render_positions(positions)
+        if pos_value is not None:
+            self.account_last_positions_value = pos_value
+        if balance is not None:
+            self.account_last_balance_usdc = balance
+        if any_success:
+            self.account_last_refresh_ts = now
+        # else: keep prior refresh_ts so the age computation in
+        # _render_account_status_label produces the stale orange marker.
+        self._render_account_status_label(now)
+
+    def _render_account_status_label(self, now=None):
+        if now is None:
+            now = time.time()
+        age = max(0.0, now - self.account_last_refresh_ts) if self.account_last_refresh_ts else None
+        b = self.account_last_balance_usdc
+        v = self.account_last_positions_value
+        n = self.account_last_positions_count
+        b_str = f"${b:.2f}" if b is not None else "--"
+        v_str = f"${v:.2f}" if v is not None else "--"
+        if age is None:
+            text = f"余额: {b_str} | 持仓市值: {v_str} | 持仓: {n} 条 | 加载中..."
+            color = "#475569"
+        else:
+            text = f"余额: {b_str} | 持仓市值: {v_str} | 持仓: {n} 条 | 刷新: {int(age)}s 前"
+            color = "#475569" if age < 90 else "#d97706"
+        self.lbl_account_status.configure(text=text, foreground=color)
+
+    async def _generate_and_push_daily_report(self, target_date_utc: str, last_path: str):
+        import csv as _csv
+        path = "trade_journal.csv"
+        if not os.path.exists(path):
+            self.logger.info("daily report skip: trade_journal.csv 不存在")
+            return
+        rows: list[dict] = []
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                rows = list(_csv.DictReader(f))
+        except OSError as e:
+            self.logger.warning("daily report 读取 journal 失败: %s", e)
+            return
+        stats = PolyQuickTrader._aggregate_daily_journal(rows, target_date_utc)
+        if stats["total_rows"] == 0:
+            self.logger.info("daily report skip: %s 当日无交易", target_date_utc)
+            # Still mark as reported so we don't retry every minute.
+            self._mark_daily_reported(target_date_utc, last_path)
+            return
+        body = PolyQuickTrader._render_daily_report_md(stats)
+        os.makedirs("reports", exist_ok=True)
+        out_path = os.path.join("reports", f"daily_report_{target_date_utc}.md")
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(body)
+        except OSError as e:
+            self.logger.warning("daily report 写文件失败: %s", e)
+        await self.push_to_server_chan(
+            f"Polymarket 日报 {target_date_utc}",
+            body,
+        )
+        self._mark_daily_reported(target_date_utc, last_path)
+
+    @staticmethod
+    def _mark_daily_reported(target_date_utc: str, last_path: str):
+        try:
+            os.makedirs(os.path.dirname(last_path) or ".", exist_ok=True)
+            with open(last_path, "w", encoding="utf-8") as f:
+                f.write(target_date_utc)
+        except OSError:
+            pass
 
     def refresh_positions_button_clicked(self):
         def worker():
@@ -2028,18 +2757,13 @@ class PolyQuickTrader:
         tick_size = str(position.get("orderPriceMinTickSize") or "0.01")
         price = self.clamp_price(price, tick_size)
         self.logger.info("提交卖出订单: %s price=%.4f size=%.4f tick=%s", token_id[:12], price, size, tick_size)
-        resp = await asyncio.wait_for(
-            asyncio.to_thread(
-                client.create_and_post_order,
-                order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.SELL),
-                options=PartialCreateOrderOptions(tick_size=tick_size),
-                order_type=OrderType.GTC,
-                post_only=False,
-            ),
-            timeout=25,
+        signed = await asyncio.to_thread(
+            client.create_order,
+            order_args=OrderArgs(token_id=token_id, price=float(price), size=float(size), side=Side.SELL),
+            options=PartialCreateOrderOptions(tick_size=tick_size),
         )
-        if isinstance(resp, dict) and resp.get("success") is False:
-            raise RuntimeError(f"交易所拒绝订单: {resp}")
+        resp = await self._post_signed_order_with_retry(client, signed, order_type=OrderType.GTC, post_only=False)
+        self._assert_order_response_ok(resp, action_name="持仓限价卖出")
         await self.push_trade_result(
             "限价卖出",
             position.get("title", ""),
@@ -2127,10 +2851,10 @@ class PolyQuickTrader:
             return
         url = f"https://sctapi.ftqq.com/{sendkey}.send"
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.post(url, data={"title": title, "desp": content}) as response:
-                    if response.status >= 400:
-                        self.logger.warning("推送返回 HTTP %s", response.status)
+            session = _get_aiohttp_session()
+            async with session.post(url, data={"title": title, "desp": content}, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status >= 400:
+                    self.logger.warning("推送返回 HTTP %s", response.status)
         except Exception as e:
             self.logger.error("推送异常: %s", e)
 
@@ -2161,6 +2885,45 @@ class PolyQuickTrader:
         decimals = self.price_decimals(tick_size)
         return round(min(max(price, tick), 1.0 - tick), decimals)
 
+    @staticmethod
+    def _extract_fill(resp, limit_price, limit_size):
+        if not isinstance(resp, dict):
+            return {"fill_price": float(limit_price), "fill_size": float(limit_size), "status": "unverified", "verified": False}
+        status_raw = resp.get("status")
+        status = str(status_raw).lower() if status_raw else ""
+        if status != "matched":
+            return {"fill_price": float(limit_price), "fill_size": float(limit_size), "status": status or "unverified", "verified": False}
+        making = resp.get("makingAmount")
+        taking = resp.get("takingAmount")
+        try:
+            making_f = float(making) if making is not None else None
+            taking_f = float(taking) if taking is not None else None
+        except (TypeError, ValueError):
+            making_f = taking_f = None
+        if making_f is None or taking_f is None or making_f <= 0 or taking_f <= 0:
+            return {"fill_price": float(limit_price), "fill_size": float(limit_size), "status": status, "verified": False}
+        fill_price = making_f / taking_f
+        fill_size = taking_f / 1_000_000.0
+        if not (0.0 < fill_price < 1.0):
+            return {"fill_price": float(limit_price), "fill_size": float(limit_size), "status": status, "verified": False}
+        return {"fill_price": fill_price, "fill_size": fill_size, "status": status, "verified": True}
+
+    @staticmethod
+    def _assert_order_response_ok(resp, action_name="订单"):
+        """
+        Raise RuntimeError with a specific status hint if resp is not a
+        success-shaped CLOB response. Per Polymarket order-lifecycle docs,
+        success statuses are: live | matched | delayed. Anything else
+        (unmatched, missing status field, success: false) must abort.
+        """
+        if not isinstance(resp, dict):
+            raise RuntimeError(f"{action_name}失败: 非 dict 响应 {type(resp).__name__}")
+        if resp.get("success") is False:
+            raise RuntimeError(f"{action_name}失败: 交易所拒绝 {resp}")
+        status = str(resp.get("status") or "").lower()
+        if status not in {"live", "matched", "delayed"}:
+            raise RuntimeError(f"{action_name}失败: 状态 '{status or '<missing>'}'，订单未稳定落地，请去 polymarket.com/portfolio 对账")
+
     def _parse_token_ids(self, raw):
         if isinstance(raw, list):
             return [str(x) for x in raw]
@@ -2182,9 +2945,12 @@ class PolyQuickTrader:
 
     def _float_or_zero(self, value):
         try:
-            return float(value)
+            result = float(value)
         except (TypeError, ValueError):
             return 0.0
+        if result != result or result in (float("inf"), float("-inf")):
+            return 0.0
+        return result
 
     def _optional_float(self, value):
         try:
@@ -2199,12 +2965,15 @@ class PolyQuickTrader:
 
 
 def acquire_single_instance_lock():
-    lock_file = open(LOCK_FILE, "w", encoding="utf-8")
+    lock_file = open(LOCK_FILE, "a+", encoding="utf-8")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    except OSError:
         print("PolyQuickTrader is already running.", file=sys.stderr)
+        lock_file.close()
         return None
+    lock_file.seek(0)
+    lock_file.truncate(0)
     lock_file.write(str(os.getpid()))
     lock_file.flush()
     return lock_file
@@ -2218,4 +2987,18 @@ if __name__ == "__main__":
     style = ttk.Style(root)
     style.theme_use("clam")
     app = PolyQuickTrader(root)
+
+    def _on_close():
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_close_aiohttp_sessions())
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            finally:
+                loop.close()
+        except Exception:
+            pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
     root.mainloop()

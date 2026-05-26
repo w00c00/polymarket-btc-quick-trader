@@ -19,3 +19,6 @@ PolyMarketMaker.app/
 .venv/
 venv/
 env/
+.ai-cycle/
+trade_journal.csv
+reports/
