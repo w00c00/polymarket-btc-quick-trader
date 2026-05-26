@@ -1603,82 +1603,140 @@ class PolyQuickTrader:
             cycle_count += 1
             self.log_live(logging.WARNING, "触发%s实盘 #%s: 第3根=%s", profile["label"], cycle_count, self.fmt_kline_time(rows[i]))
             accumulated_loss = 0.0
+            cycle_open_positions: list[dict] = []
             for layer, stake in enumerate(stakes, start=1):
-                if self.live_auto_stop_requested.is_set() or time.time() >= deadline:
-                    break
-                trade_open = trigger_key + layer * 15 * 60 * 1000
-                wait_seconds = max(0, trade_open / 1000 - time.time())
-                if wait_seconds > 0:
-                    self.log_live(logging.INFO, "等待第 %s 单对应市场开盘，约 %.0f 秒", layer, wait_seconds)
-                    await self.sleep_with_stop(wait_seconds, self.live_auto_stop_requested)
-                if self.live_auto_stop_requested.is_set():
-                    break
-
-                target_slug = f"btc-updown-15m-{int(trade_open / 1000)}"
-                market = await self.fetch_market_by_slug(target_slug)
-                for _ in range(3):
-                    if market or self.live_auto_stop_requested.is_set():
+                try:
+                    if self.live_auto_stop_requested.is_set() or time.time() >= deadline:
                         break
-                    self.log_live(logging.INFO, "等待 Polymarket 创建目标市场: %s", target_slug)
-                    await self.sleep_with_stop(5, self.live_auto_stop_requested)
+                    trade_open = trigger_key + layer * 15 * 60 * 1000
+                    wait_seconds = max(0, trade_open / 1000 - time.time())
+                    if wait_seconds > 0:
+                        self.log_live(logging.INFO, "等待第 %s 单对应市场开盘，约 %.0f 秒", layer, wait_seconds)
+                        await self.sleep_with_stop(wait_seconds, self.live_auto_stop_requested)
+                    if self.live_auto_stop_requested.is_set():
+                        break
+
+                    target_slug = f"btc-updown-15m-{int(trade_open / 1000)}"
                     market = await self.fetch_market_by_slug(target_slug)
-                if not market:
-                    self.log_live(logging.WARNING, "未找到反转实盘目标市场，跳过本周期: %s", target_slug)
-                    break
-                token_id = getattr(market, profile["token_attr"])
-                book = await self.best_bid_ask_for_token(token_id)
-                ask = book["ask"] if book["ask"] is not None else getattr(market, profile["ask_attr"])
-                if ask > config["entry_price"]:
-                    self.log_live(logging.WARNING, "第 %s 单跳过: %s ask=%.4f 高于最高入场价 %.4f", layer, profile["direction"], ask, config["entry_price"])
-                    break
+                    for _ in range(3):
+                        if market or self.live_auto_stop_requested.is_set():
+                            break
+                        self.log_live(logging.INFO, "等待 Polymarket 创建目标市场: %s", target_slug)
+                        await self.sleep_with_stop(5, self.live_auto_stop_requested)
+                        market = await self.fetch_market_by_slug(target_slug)
+                    if not market:
+                        self.log_live(logging.WARNING, "未找到反转实盘目标市场，跳过本周期: %s", target_slug)
+                        if cycle_open_positions:
+                            await self._flatten_cycle_positions(cycle_open_positions, f"market_not_found:{target_slug}", cycle_count)
+                        break
+                    token_id = getattr(market, profile["token_attr"])
+                    book = await self.best_bid_ask_for_token(token_id)
+                    ask = book["ask"] if book["ask"] is not None else getattr(market, profile["ask_attr"])
+                    if ask > config["entry_price"]:
+                        self.log_live(logging.WARNING, "第 %s 单跳过: %s ask=%.4f 高于最高入场价 %.4f", layer, profile["direction"], ask, config["entry_price"])
+                        if cycle_open_positions:
+                            await self._flatten_cycle_positions(cycle_open_positions, f"ask_too_high:{ask:.4f}>{config['entry_price']:.4f}", cycle_count)
+                        break
 
-                buy_details = await self.buy_quick_market(market, profile["direction"], stake, config["entry_price"])
-                entry = float(buy_details["price"])
-                size = float(buy_details["size"])
-                fill_verified = bool(buy_details.get("fill_verified"))
-                fill_status = buy_details.get("fill_status", "unknown")
-                if not fill_verified:
-                    self.log_live(logging.WARNING, "第 %s 单成交价未验证（fill_status=%s），后续 PnL 使用 limit 估算", layer, fill_status)
-                row = {
-                    "round": f"R{cycle_count}-{layer}",
-                    "slug": market.slug,
-                    "status": "OPEN_REAL",
-                    "direction": profile["direction"],
-                    "entry": entry,
-                    "current": entry,
-                    "high": entry,
-                    "exit": None,
-                    "pnl": -accumulated_loss,
-                    "pnl_pct": 0.0,
-                    "entered": True,
-                    "result": f"OPEN_REAL | stake={stake:.2f}U | entry={entry:.4f} | verified={fill_verified}",
-                }
-                self.live_results.append(row)
-                self.root.after(0, self.render_live_results)
-                await self.push_to_server_chan(
-                    "Polymarket 反转实盘买入",
-                    f"### Polymarket 反转实盘买入\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 金额: `{stake:.2f}` USDC\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 数量: `{size:.4f}`",
-                )
-
-                wait_until_close = 0
-                if market.end_dt:
-                    wait_until_close = max(0, market.end_dt.timestamp() - time.time() + 2)
-                if wait_until_close > 0:
-                    self.log_live(logging.INFO, "等待第 %s 单结算，约 %.0f 秒", layer, wait_until_close)
-                    await self.sleep_with_stop(wait_until_close)
-                # market end_dt + 5min grace as upper bound for settlement detection;
-                # fall back to 30 min from now if end_dt missing.
-                settle_deadline = (market.end_dt.timestamp() + 300) if market.end_dt else (time.time() + 1800)
-                token_id_settled = getattr(market, profile["token_attr"])
-                outcome = await self._settle_from_positions(token_id_settled, settle_deadline, self.live_auto_stop_requested)
-                if outcome == "win":
-                    pnl = (1.0 - entry) * size - accumulated_loss
-                    row.update({"status": "REVERSAL_REAL_WIN", "current": 1.0, "high": 1.0, "exit": 1.0, "pnl": pnl, "pnl_pct": pnl / stake * 100 if stake else 0.0})
+                    buy_details = await self.buy_quick_market(market, profile["direction"], stake, config["entry_price"])
+                    entry = float(buy_details["price"])
+                    size = float(buy_details["size"])
+                    fill_verified = bool(buy_details.get("fill_verified"))
+                    fill_status = buy_details.get("fill_status", "unknown")
+                    cycle_open_positions.append({
+                        "layer": layer,
+                        "token_id": buy_details["token_id"],
+                        "tick_size": str(buy_details.get("tick_size") or "0.01"),
+                        "fill_size": float(buy_details["size"]),
+                        "entry": float(buy_details["price"]),
+                    })
+                    if not fill_verified:
+                        self.log_live(logging.WARNING, "第 %s 单成交价未验证（fill_status=%s），后续 PnL 使用 limit 估算", layer, fill_status)
+                    row = {
+                        "round": f"R{cycle_count}-{layer}",
+                        "slug": market.slug,
+                        "status": "OPEN_REAL",
+                        "direction": profile["direction"],
+                        "entry": entry,
+                        "current": entry,
+                        "high": entry,
+                        "exit": None,
+                        "pnl": -accumulated_loss,
+                        "pnl_pct": 0.0,
+                        "entered": True,
+                        "result": f"OPEN_REAL | stake={stake:.2f}U | entry={entry:.4f} | verified={fill_verified}",
+                    }
+                    self.live_results.append(row)
                     self.root.after(0, self.render_live_results)
-                    self.log_live(logging.WARNING, "%s 实盘第 %s 单胜 (data-api redeemable=True): pnl≈%+.2fU", profile["label"], layer, pnl)
+                    await self.push_to_server_chan(
+                        "Polymarket 反转实盘买入",
+                        f"### Polymarket 反转实盘买入\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 金额: `{stake:.2f}` USDC\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 数量: `{size:.4f}`",
+                    )
+
+                    wait_until_close = 0
+                    if market.end_dt:
+                        wait_until_close = max(0, market.end_dt.timestamp() - time.time() + 2)
+                    if wait_until_close > 0:
+                        self.log_live(logging.INFO, "等待第 %s 单结算，约 %.0f 秒", layer, wait_until_close)
+                        await self.sleep_with_stop(wait_until_close)
+                    # market end_dt + 5min grace as upper bound for settlement detection;
+                    # fall back to 30 min from now if end_dt missing.
+                    settle_deadline = (market.end_dt.timestamp() + 300) if market.end_dt else (time.time() + 1800)
+                    token_id_settled = getattr(market, profile["token_attr"])
+                    outcome = await self._settle_from_positions(token_id_settled, settle_deadline, self.live_auto_stop_requested)
+                    if outcome == "win":
+                        pnl = (1.0 - entry) * size - accumulated_loss
+                        row.update({"status": "REVERSAL_REAL_WIN", "current": 1.0, "high": 1.0, "exit": 1.0, "pnl": pnl, "pnl_pct": pnl / stake * 100 if stake else 0.0})
+                        self.root.after(0, self.render_live_results)
+                        self.log_live(logging.WARNING, "%s 实盘第 %s 单胜 (data-api redeemable=True): pnl≈%+.2fU", profile["label"], layer, pnl)
+                        await self.push_to_server_chan(
+                            "Polymarket 反转实盘结果",
+                            f"### Polymarket 反转实盘结果\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 结果: `WIN`\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 结算: `data-api redeemable`\n- 本行盈亏估算: `{pnl:+.2f}` USDC",
+                        )
+                        self._append_trade_journal({
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "strategy": profile["label"], "cycle": cycle_count, "layer": layer,
+                            "market_slug": market.slug, "direction": profile["direction"],
+                            "stake_usdc": f"{stake:.4f}", "requested_price": f"{config['entry_price']:.4f}",
+                            "fill_price": f"{entry:.4f}", "fill_size": f"{size:.6f}",
+                            "fill_verified": str(fill_verified), "outcome": outcome,
+                            "pnl_estimate": f"{pnl:+.4f}", "accumulated_loss": f"{accumulated_loss:.4f}",
+                        })
+                        # WIN path: `pnl` already subtracted accumulated_loss for this cycle, but
+                        # the prior LOSS layers already added their own -loss to cycle_pnl_running.
+                        # Adding `pnl` directly here would double-count earlier losses. Restore the
+                        # accumulated_loss term so the running total is the sum of per-layer outcomes.
+                        cycle_pnl_running += pnl + accumulated_loss
+                        cycle_open_positions = [p for p in cycle_open_positions if p["layer"] != layer]
+                        break
+                    if outcome == "pending_timeout":
+                        self.log_live(logging.ERROR, "%s 实盘第 %s 单结算异常 (deadline 超出，需人工介入)", profile["label"], layer)
+                        await self.push_to_server_chan(
+                            "Polymarket 反转实盘 ⚠️ 结算异常",
+                            f"### ⚠️ 反转实盘结算异常\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 市场: `{market.slug}`\n- token: `{token_id_settled[:12]}...`\n- 入场: `{entry:.4f}`\n- 仓位结算状态超 deadline 未确定，请去 polymarket.com/portfolio 人工核对",
+                        )
+                        self._append_trade_journal({
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "strategy": profile["label"], "cycle": cycle_count, "layer": layer,
+                            "market_slug": market.slug, "direction": profile["direction"],
+                            "stake_usdc": f"{stake:.4f}", "requested_price": f"{config['entry_price']:.4f}",
+                            "fill_price": f"{entry:.4f}", "fill_size": f"{size:.6f}",
+                            "fill_verified": str(fill_verified), "outcome": outcome,
+                            "pnl_estimate": "0.0000", "accumulated_loss": f"{accumulated_loss:.4f}",
+                        })
+                        if cycle_open_positions:
+                            await self._flatten_cycle_positions(cycle_open_positions, f"pending_timeout:layer{layer}", cycle_count)
+                        return f"已停止 (结算异常 + 回滚)，触发周期={cycle_count}"
+                    # outcome == "loss"
+                    loss = entry * size
+                    accumulated_loss += loss
+                    pnl = -loss
+                    row.update({"status": "REVERSAL_REAL_LOSS" if layer == len(stakes) else "REVERSAL_REAL_NEXT", "current": 0.0, "high": row.get("high", entry), "exit": 0.0, "pnl": pnl, "pnl_pct": pnl / stake * 100 if stake else 0.0})
+                    self.root.after(0, self.render_live_results)
+                    self.log_live(logging.WARNING, "%s 实盘第 %s 单负 (data-api 仓位归零): loss≈%.2fU", profile["label"], layer, loss)
                     await self.push_to_server_chan(
                         "Polymarket 反转实盘结果",
-                        f"### Polymarket 反转实盘结果\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 结果: `WIN`\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 结算: `data-api redeemable`\n- 本行盈亏估算: `{pnl:+.2f}` USDC",
+                        f"### Polymarket 反转实盘结果\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 结果: `LOSS`\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 结算: `data-api 仓位归零`\n- 本行盈亏估算: `{pnl:+.2f}` USDC",
                     )
                     self._append_trade_journal({
                         "ts": datetime.now(timezone.utc).isoformat(),
@@ -1689,49 +1747,35 @@ class PolyQuickTrader:
                         "fill_verified": str(fill_verified), "outcome": outcome,
                         "pnl_estimate": f"{pnl:+.4f}", "accumulated_loss": f"{accumulated_loss:.4f}",
                     })
-                    # WIN path: `pnl` already subtracted accumulated_loss for this cycle, but
-                    # the prior LOSS layers already added their own -loss to cycle_pnl_running.
-                    # Adding `pnl` directly here would double-count earlier losses. Restore the
-                    # accumulated_loss term so the running total is the sum of per-layer outcomes.
-                    cycle_pnl_running += pnl + accumulated_loss
-                    break
-                if outcome == "pending_timeout":
-                    self.log_live(logging.ERROR, "%s 实盘第 %s 单结算异常 (deadline 超出，需人工介入)", profile["label"], layer)
-                    await self.push_to_server_chan(
-                        "Polymarket 反转实盘 ⚠️ 结算异常",
-                        f"### ⚠️ 反转实盘结算异常\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 市场: `{market.slug}`\n- token: `{token_id_settled[:12]}...`\n- 入场: `{entry:.4f}`\n- 仓位结算状态超 deadline 未确定，请去 polymarket.com/portfolio 人工核对",
-                    )
-                    self._append_trade_journal({
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "strategy": profile["label"], "cycle": cycle_count, "layer": layer,
-                        "market_slug": market.slug, "direction": profile["direction"],
-                        "stake_usdc": f"{stake:.4f}", "requested_price": f"{config['entry_price']:.4f}",
-                        "fill_price": f"{entry:.4f}", "fill_size": f"{size:.6f}",
-                        "fill_verified": str(fill_verified), "outcome": outcome,
-                        "pnl_estimate": "0.0000", "accumulated_loss": f"{accumulated_loss:.4f}",
-                    })
-                    return f"已停止 (结算异常)，触发周期={cycle_count}"
-                # outcome == "loss"
-                loss = entry * size
-                accumulated_loss += loss
-                pnl = -loss
-                row.update({"status": "REVERSAL_REAL_LOSS" if layer == len(stakes) else "REVERSAL_REAL_NEXT", "current": 0.0, "high": row.get("high", entry), "exit": 0.0, "pnl": pnl, "pnl_pct": pnl / stake * 100 if stake else 0.0})
-                self.root.after(0, self.render_live_results)
-                self.log_live(logging.WARNING, "%s 实盘第 %s 单负 (data-api 仓位归零): loss≈%.2fU", profile["label"], layer, loss)
-                await self.push_to_server_chan(
-                    "Polymarket 反转实盘结果",
-                    f"### Polymarket 反转实盘结果\n\n- 策略: `{profile['label']}`\n- 周期: `{cycle_count}`\n- 层数: `{layer}`\n- 方向: `{profile['direction']}`\n- 市场: `{market.slug}`\n- 结果: `LOSS`\n- 入场: `{entry:.4f} (verified={fill_verified})`\n- 结算: `data-api 仓位归零`\n- 本行盈亏估算: `{pnl:+.2f}` USDC",
-                )
-                self._append_trade_journal({
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "strategy": profile["label"], "cycle": cycle_count, "layer": layer,
-                    "market_slug": market.slug, "direction": profile["direction"],
-                    "stake_usdc": f"{stake:.4f}", "requested_price": f"{config['entry_price']:.4f}",
-                    "fill_price": f"{entry:.4f}", "fill_size": f"{size:.6f}",
-                    "fill_verified": str(fill_verified), "outcome": outcome,
-                    "pnl_estimate": f"{pnl:+.4f}", "accumulated_loss": f"{accumulated_loss:.4f}",
-                })
-                cycle_pnl_running += pnl
+                    cycle_pnl_running += pnl
+                    cycle_open_positions = [p for p in cycle_open_positions if p["layer"] != layer]
+                except Exception as exc:
+                    self.log_live(logging.ERROR, "反转实盘 layer %s 异常中断: %s", layer, exc)
+                    # Phase 2 retry-post timeout (RuntimeError) can raise AFTER
+                    # the exchange actually accepted the order. cycle_open_positions
+                    # only has confirmed layers — probe data-api for THIS layer's
+                    # token to detect on-chain orphan and include it in flatten.
+                    pending_token_id = locals().get("token_id")
+                    if pending_token_id and not any(p.get("layer") == layer for p in cycle_open_positions):
+                        try:
+                            probe_positions = await self._fetch_positions_raw()
+                            probe_match = next((p for p in probe_positions if p.get("asset") == pending_token_id), None)
+                            if probe_match and self._float_or_zero(probe_match.get("size")) > 0.000001:
+                                pending_market = locals().get("market")
+                                pending_tick = str(getattr(pending_market, "tick_size", None) or "0.01") if pending_market else "0.01"
+                                cycle_open_positions.append({
+                                    "layer": layer,
+                                    "token_id": pending_token_id,
+                                    "tick_size": pending_tick,
+                                    "fill_size": self._float_or_zero(probe_match.get("size")),
+                                    "entry": self._float_or_zero(probe_match.get("avgPrice")),
+                                })
+                                self.log_live(logging.WARNING, "layer %s 异常时仓位仍在 size=%.4f，加入回滚", layer, self._float_or_zero(probe_match.get("size")))
+                        except Exception as probe_exc:
+                            self.log_live(logging.ERROR, "layer %s 异常后查仓位失败: %s — flatten 可能不完整", layer, probe_exc)
+                    if cycle_open_positions:
+                        await self._flatten_cycle_positions(cycle_open_positions, f"layer_exception:{type(exc).__name__}:{str(exc)[:120]}", cycle_count)
+                    raise
                 if self.live_auto_stop_requested.is_set():
                     break
             await self.sleep_with_stop(60, self.live_auto_stop_requested)
@@ -2054,6 +2098,57 @@ class PolyQuickTrader:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 1.5, 60.0)
         return "pending_timeout"
+
+    async def _flatten_cycle_positions(self, open_positions: list[dict], reason: str, cycle_count: int):
+        """
+        Best-effort flatten of every position opened in the current reversal cycle
+        that has not yet resolved. Used when the layer loop aborts mid-cycle so
+        the user is not left holding wrong-direction bags.
+
+        For each open position: read best_bid_ask_for_token; pick a marketable
+        sell price (0.95 * best_bid for slippage tolerance), floored at tick_size
+        to avoid clamp-to-zero on thin books; submit sell_token_limit. Log each
+        step. Push one Server酱 critical summary at the end.
+
+        Known limitation: sell_token_limit still uses Phase 2's retry-post path,
+        so a timeout-then-double race is still possible on the rollback sells
+        themselves. The Server酱 push tells the user to reconcile manually at
+        polymarket.com/portfolio as the last line of defense.
+        """
+        results = []
+        for pos in open_positions:
+            token_id = pos["token_id"]
+            try:
+                book = await self.best_bid_ask_for_token(token_id)
+                bid = book.get("bid")
+                tick_size = book.get("tick_size") or pos["tick_size"]
+                tick_value = float(tick_size) if tick_size else 0.01
+                if bid is None or bid <= 0:
+                    sell_price = self.clamp_price(tick_value, tick_size)
+                    self.log_live(logging.WARNING, "rollback layer %s 无 bid，使用最低价 %.4f", pos["layer"], sell_price)
+                else:
+                    raw_price = max(bid * 0.95, tick_value)
+                    sell_price = self.clamp_price(raw_price, tick_size)
+                resp = await self.sell_token_limit(token_id, pos["fill_size"], sell_price, tick_size)
+                self.log_live(logging.WARNING, "rollback layer %s 卖出: size=%.4f price=%.4f resp=%s", pos["layer"], pos["fill_size"], sell_price, str(resp)[:120])
+                results.append({"layer": pos["layer"], "ok": True, "price": sell_price, "size": pos["fill_size"]})
+            except Exception as e:
+                self.log_live(logging.ERROR, "rollback layer %s 卖出失败: %s", pos["layer"], e)
+                results.append({"layer": pos["layer"], "ok": False, "error": str(e)[:200], "token_id": token_id[:12]})
+        try:
+            lines = []
+            for r in results:
+                if r["ok"]:
+                    lines.append(f"- layer {r['layer']}: OK {r['price']:.4f} x {r['size']:.4f}")
+                else:
+                    lines.append(f"- layer {r['layer']}: FAIL {r.get('error', '')}")
+            await self.push_to_server_chan(
+                "Polymarket 反转实盘 ⚠️ 周期回滚",
+                f"### ⚠️ 反转实盘周期中断回滚\n\n- 周期: `{cycle_count}`\n- 原因: `{reason}`\n- 回滚结果:\n" + "\n".join(lines) + "\n\n请去 polymarket.com/portfolio 人工对账。",
+            )
+        except Exception as e:
+            self.logger.error("rollback Server酱 推送失败: %s", e)
+        return results
 
     async def _post_signed_order_with_retry(
         self,
