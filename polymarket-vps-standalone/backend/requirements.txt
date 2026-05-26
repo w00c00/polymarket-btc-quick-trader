@@ -1,0 +1,5 @@
+aiohttp==3.9.5
+cryptography==42.0.8
+fastapi==0.111.0
+py-clob-client-v2
+uvicorn[standard]==0.30.1

@@ -1,0 +1,201 @@
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import time
+from pathlib import Path
+
+
+DEFAULT_USERS_PATH = Path(os.environ.get("POLY_VPS_USERS_PATH", "data/users.json"))
+USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{3,32}$")
+DEFAULT_ADMIN_USERNAME = "poly"
+DEFAULT_ADMIN_PASSWORD = "123456"
+STATUS_APPROVED = "approved"
+STATUS_PENDING = "pending"
+
+
+def b64(value: bytes) -> str:
+    return base64.b64encode(value).decode("ascii")
+
+
+def b64d(value: str) -> bytes:
+    return base64.b64decode(value.encode("ascii"))
+
+
+def password_hash(password: str, salt: bytes | None = None, iterations: int = 310000):
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return {
+        "algorithm": "pbkdf2_sha256",
+        "iterations": iterations,
+        "salt": b64(salt),
+        "hash": b64(digest),
+    }
+
+
+def verify_password(password: str, stored: dict):
+    if stored.get("algorithm") != "pbkdf2_sha256":
+        return False
+    candidate = password_hash(password, b64d(stored["salt"]), int(stored["iterations"]))
+    return hmac.compare_digest(candidate["hash"], stored["hash"])
+
+
+class UserStore:
+    def __init__(self, path: Path = DEFAULT_USERS_PATH):
+        self.path = path
+        self.sessions = {}
+        self.users = self._load()
+        self._ensure_default_admin()
+
+    def _load(self):
+        if not self.path.exists():
+            return {}
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def _save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(self.users, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(tmp_path, 0o600)
+        tmp_path.replace(self.path)
+
+    def _ensure_default_admin(self):
+        changed = False
+        for username, user in self.users.items():
+            if username != DEFAULT_ADMIN_USERNAME and user.get("role") == "admin":
+                user["role"] = "user"
+                user.setdefault("password_change_required", False)
+                changed = True
+            if "status" not in user:
+                user["status"] = STATUS_APPROVED
+                changed = True
+        user = self.users.get(DEFAULT_ADMIN_USERNAME)
+        if user and user.get("role") == "admin":
+            if user.get("status") != STATUS_APPROVED:
+                user["status"] = STATUS_APPROVED
+                changed = True
+            if changed:
+                self._save()
+            return
+        self.users[DEFAULT_ADMIN_USERNAME] = {
+            "password": password_hash(DEFAULT_ADMIN_PASSWORD),
+            "created_at": int(time.time()),
+            "role": "admin",
+            "status": STATUS_APPROVED,
+            "settings": {},
+            "password_change_required": True,
+        }
+        self._save()
+
+    def register(self, username: str, password: str):
+        username = username.strip()
+        if not USERNAME_PATTERN.match(username):
+            raise ValueError("用户名只能使用 3-32 位字母、数字、下划线或横线。")
+        if len(password) < 10:
+            raise ValueError("密码至少 10 位。")
+        if username in self.users:
+            raise ValueError("用户名已存在。")
+        self.users[username] = {
+            "password": password_hash(password),
+            "created_at": int(time.time()),
+            "role": "user",
+            "status": STATUS_PENDING,
+            "settings": {},
+            "password_change_required": False,
+        }
+        self._save()
+
+    def login(self, username: str, password: str):
+        user = self.users.get(username)
+        if not user or not verify_password(password, user.get("password") or {}):
+            raise ValueError("用户名或密码错误。")
+        if user.get("status", STATUS_APPROVED) != STATUS_APPROVED:
+            raise ValueError("账号正在等待管理员审批。")
+        token = secrets.token_urlsafe(32)
+        self.sessions[token] = {
+            "username": username,
+            "created_at": int(time.time()),
+        }
+        return token
+
+    def public_user(self, username: str):
+        user = self.users.get(username) or {}
+        return {
+            "username": username,
+            "role": user.get("role", "user"),
+            "created_at": user.get("created_at"),
+            "status": user.get("status", STATUS_APPROVED),
+            "settings": user.get("settings") or {},
+            "password_change_required": bool(user.get("password_change_required")),
+        }
+
+    def change_password(self, username: str, old_password: str, new_password: str):
+        user = self.users.get(username)
+        if not user or not verify_password(old_password, user.get("password") or {}):
+            raise ValueError("旧密码错误。")
+        if len(new_password) < 6:
+            raise ValueError("新密码至少 6 位。")
+        user["password"] = password_hash(new_password)
+        user["password_change_required"] = False
+        self._save()
+
+    def logout(self, token: str):
+        self.sessions.pop(token, None)
+
+    def user_for_token(self, token: str | None):
+        if not token:
+            return None
+        session = self.sessions.get(token)
+        if not session:
+            return None
+        return session["username"]
+
+    def list_users(self):
+        return [self.public_user(username) for username in sorted(self.users)]
+
+    def approve_user(self, username: str):
+        user = self.users.get(username)
+        if not user:
+            raise ValueError("用户不存在。")
+        if user.get("role") == "admin":
+            raise ValueError("管理员无需审批。")
+        user["status"] = STATUS_APPROVED
+        self._save()
+
+    def reject_user(self, username: str):
+        user = self.users.get(username)
+        if not user:
+            raise ValueError("用户不存在。")
+        if user.get("role") == "admin":
+            raise ValueError("不能拒绝管理员。")
+        self.delete_user(username)
+
+    def is_admin(self, username: str):
+        return (self.users.get(username) or {}).get("role") == "admin"
+
+    def delete_user(self, username: str):
+        if username not in self.users:
+            raise ValueError("用户不存在。")
+        if self.users[username].get("role") == "admin":
+            admin_count = sum(1 for item in self.users.values() if item.get("role") == "admin")
+            if admin_count <= 1:
+                raise ValueError("不能删除最后一个管理员。")
+        self.users.pop(username)
+        for token, session in list(self.sessions.items()):
+            if session.get("username") == username:
+                self.sessions.pop(token, None)
+        self._save()
+
+    def update_settings(self, username: str, settings: dict):
+        if username not in self.users:
+            raise ValueError("用户不存在。")
+        current = self.users[username].setdefault("settings", {})
+        current.update(settings)
+        self._save()
+        return current
+
+    def settings(self, username: str):
+        return (self.users.get(username) or {}).get("settings") or {}
