@@ -120,6 +120,12 @@ function show(id, value) {
   $(id).textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
 }
 
+function showGuide(title, html) {
+  $("guideTitle").textContent = title;
+  $("guideContent").innerHTML = html;
+  $("guideDialog").showModal();
+}
+
 function formatPrice(value) {
   return Number(value || 0).toFixed(2);
 }
@@ -136,6 +142,16 @@ function params(prefix = "") {
     entry_price: Number($(`${prefix}entry`)?.value || $("entry").value),
     fee_rate: 0.07,
   };
+}
+
+function durationHours(prefix) {
+  const preset = $(`${prefix}DurationPreset`).value;
+  if (preset === "custom") return Number($(`${prefix}Hours`).value || 24);
+  return Number(preset || 24);
+}
+
+function toggleDurationInput(prefix) {
+  $(`${prefix}HoursWrap`).classList.toggle("hidden", $(`${prefix}DurationPreset`).value !== "custom");
 }
 
 function setSelectedMarket(index) {
@@ -227,14 +243,22 @@ async function sellPosition(index) {
 }
 
 async function startDryRun(mode) {
+  return startStrategy(mode, true, "live");
+}
+
+async function startReal(mode) {
+  return startStrategy(mode, false, "real");
+}
+
+async function startStrategy(mode, dryRun, prefix) {
   const body = {
     mode,
-    initial_usdc: Number($("liveInitial").value),
-    max_layers: Number($("liveLayers").value),
-    entry_price: Number($("liveEntry").value),
-    max_hours: Number($("liveHours").value),
+    initial_usdc: Number($(`${prefix}Initial`).value),
+    max_layers: Number($(`${prefix}Layers`).value),
+    entry_price: Number($(`${prefix}Entry`).value),
+    max_hours: durationHours(prefix),
     fee_rate: 0.07,
-    dry_run: true,
+    dry_run: dryRun,
   };
   return api("/api/strategy/live/start", {method: "POST", body: JSON.stringify(body)});
 }
@@ -298,7 +322,7 @@ bootstrapSession();
 
 $("healthBtn").onclick = async () => { try { show("manualBox", await api("/api/health")); } catch (e) { show("manualBox", e.message); } };
 $("scanBtn").onclick = async () => { $("marketsBody").innerHTML = "<tr><td colspan='7'>扫描中...</td></tr>"; try { renderMarkets((await api("/api/markets/quick")).items); } catch (e) { $("marketsBody").innerHTML = `<tr><td colspan='7'>${e.message}</td></tr>`; } };
-$("predictBtn").onclick = async () => { try { if (!selectedMarket) throw new Error("请先选择市场。"); show("manualBox", "预测中..."); const data = await api("/api/strategy/predict", {method: "POST", body: JSON.stringify({market: selectedMarket, days: 3})}); show("manualBox", {market: selectedMarket.question, market_time_bj: selectedMarket.time_label_bj, action: data.action, up_probability: formatPct(data.up_probability), down_probability: formatPct(data.down_probability), confidence: formatPct(data.confidence), last_price: Number(data.last_price.toFixed(2)), last_kline: data.last_kline_bj || data.last_kline, signals: data.signals, note: data.note}); } catch (e) { show("manualBox", e.message); } };
+$("predictBtn").onclick = async () => { try { if (!selectedMarket) throw new Error("请先选择市场。"); show("predictionBox", "预测中..."); const data = await api("/api/strategy/predict", {method: "POST", body: JSON.stringify({market: selectedMarket, days: 3})}); show("predictionBox", {type: "选中周期方向预测", market: selectedMarket.question, market_time_bj: selectedMarket.time_label_bj, action: data.action, up_probability: formatPct(data.up_probability), down_probability: formatPct(data.down_probability), confidence: formatPct(data.confidence), last_price: Number(data.last_price.toFixed(2)), last_kline: data.last_kline_bj || data.last_kline, signals: {ret_45m: data.signals?.ret_45m, ret_120m: data.signals?.ret_120m, ret_240m: data.signals?.ret_240m, rsi14: data.signals?.rsi14}, note: "手动页预测只看当前选中周期的方向概率，不触发三连策略。"}); } catch (e) { show("predictionBox", e.message); } };
 $("snapshotBtn").onclick = async () => { try { await refreshSnapshot(); } catch (e) { show("manualBox", e.message); } };
 $("buyUpBtn").onclick = async () => { try { await submitManual("UP"); } catch (e) { show("manualBox", e.message); } };
 $("buyDownBtn").onclick = async () => { try { await submitManual("DOWN"); } catch (e) { show("manualBox", e.message); } };
@@ -319,14 +343,56 @@ $("unlockVaultBtn").onclick = async () => { try { show("vaultBox", await api("/a
 $("lockVaultBtn").onclick = async () => { try { show("vaultBox", await api("/api/vault/lock", {method: "POST"})); } catch (e) { show("vaultBox", e.message); } };
 $("vaultStatusBtn").onclick = async () => { try { show("vaultBox", await api("/api/vault/status")); } catch (e) { show("vaultBox", e.message); } };
 
+$("liveDurationPreset").onchange = () => toggleDurationInput("live");
+$("realDurationPreset").onchange = () => toggleDurationInput("real");
+$("reportPeriod").onchange = () => $("reportHoursWrap").classList.toggle("hidden", $("reportPeriod").value !== "custom");
+
 $("startDryRunBtn").onclick = async () => { try { show("liveBox", await startDryRun($("liveMode").value)); renderLiveStatus(await api("/api/strategy/live/status")); } catch (e) { show("liveBox", e.message); } };
 $("startBothDryRunBtn").onclick = async () => { try { const a = await startDryRun("三连阴转UP"); const b = await startDryRun("三连阳转DOWN"); show("liveBox", {red_up: a, green_down: b}); renderLiveStatus(await api("/api/strategy/live/status")); } catch (e) { show("liveBox", e.message); } };
 $("stopLiveBtn").onclick = async () => { try { show("liveBox", await api("/api/strategy/live/stop", {method: "POST"})); renderLiveStatus(await api("/api/strategy/live/status")); } catch (e) { show("liveBox", e.message); } };
 $("liveStatusBtn").onclick = async () => { try { const data = await api("/api/strategy/live/status"); renderLiveStatus(data); show("liveBox", data); } catch (e) { show("liveBox", e.message); } };
 
-$("loadNotifyBtn").onclick = async () => { try { const data = await api("/api/settings/notifications"); $("telegramToken").value = data.telegram_bot_token || ""; $("telegramChat").value = data.telegram_chat_id || ""; $("dailyReportTime").value = data.daily_report_time || "21:30"; show("notifyBox", data); } catch (e) { show("notifyBox", e.message); } };
-$("saveNotifyBtn").onclick = async () => { try { show("notifyBox", await api("/api/settings/notifications", {method: "POST", body: JSON.stringify({telegram_bot_token: $("telegramToken").value, telegram_chat_id: $("telegramChat").value, daily_report_time: $("dailyReportTime").value || "21:30"})})); } catch (e) { show("notifyBox", e.message); } };
-$("sendReportBtn").onclick = async () => { try { show("notifyBox", await api("/api/reports/send_now", {method: "POST"})); } catch (e) { show("notifyBox", e.message); } };
+$("enableLiveBtn").onclick = () => {
+  const ok = window.confirm("确认显示实盘策略页？实盘任务会使用真实凭证，连续亏损会触发加注本金占用。");
+  if (!ok) return;
+  $("liveTabBtn").classList.remove("hidden");
+  setActiveTab("liveStrategy");
+};
+$("startRealBtn").onclick = async () => { try { if (!window.confirm("二次确认：启动选中策略实盘？")) return; show("realBox", await startReal($("realMode").value)); renderLiveStatus(await api("/api/strategy/live/status")); } catch (e) { show("realBox", e.message); } };
+$("startBothRealBtn").onclick = async () => { try { if (!window.confirm("二次确认：同时启动正反实盘？这会占用双倍本金，且可能互相对冲。")) return; const a = await startReal("三连阴转UP"); const b = await startReal("三连阳转DOWN"); show("realBox", {red_up: a, green_down: b}); renderLiveStatus(await api("/api/strategy/live/status")); } catch (e) { show("realBox", e.message); } };
+$("realStatusBtn").onclick = async () => { try { const data = await api("/api/strategy/live/status"); renderLiveStatus(data); show("realBox", data); } catch (e) { show("realBox", e.message); } };
+
+$("loadNotifyBtn").onclick = async () => { try { const data = await api("/api/settings/notifications"); $("notifyServerChan").value = data.server_chan_sendkey || ""; $("telegramToken").value = data.telegram_bot_token || ""; $("telegramChat").value = data.telegram_chat_id || ""; $("dailyReportTime").value = data.daily_report_time || "21:30"; show("notifyBox", data); } catch (e) { show("notifyBox", e.message); } };
+$("saveNotifyBtn").onclick = async () => { try { show("notifyBox", await api("/api/settings/notifications", {method: "POST", body: JSON.stringify({server_chan_sendkey: $("notifyServerChan").value, telegram_bot_token: $("telegramToken").value, telegram_chat_id: $("telegramChat").value, daily_report_time: $("dailyReportTime").value || "21:30"})})); } catch (e) { show("notifyBox", e.message); } };
+$("sendReportBtn").onclick = async () => { try { show("notifyBox", await api("/api/reports/send_now", {method: "POST", body: JSON.stringify({period: $("reportPeriod").value, hours: $("reportPeriod").value === "custom" ? Number($("reportHours").value || 24) : null})})); } catch (e) { show("notifyBox", e.message); } };
+
+$("guideCloseBtn").onclick = () => $("guideDialog").close();
+$("credentialGuideBtn").onclick = () => showGuide("凭证填写指南", `
+  <h3>Polymarket 钱包凭证</h3>
+  <p>常见有三类：浏览器钱包地址、代理/Funder 地址、CLOB API 三件套。VPS 程序最稳定的方式是填写 Polygon 私钥 + Funder 地址 + 签名类型，然后由程序自动派生 CLOB API Key、Secret、Passphrase。</p>
+  <ul>
+    <li><b>Polygon 私钥</b>：用于签名，不要使用主钱包，建议单独建交易钱包，只放策略本金。</li>
+    <li><b>Funder 地址</b>：Polymarket 代理钱包/资金地址。签名类型为 1 或 2 或 3 时通常必须填写。</li>
+    <li><b>签名类型</b>：普通 EOA 通常是 0；Polymarket 代理钱包常见是 1/2/3。你之前用 Polymarket 网页充值到平台账户，通常应按代理钱包方式填 Funder。</li>
+    <li><b>CLOB 三件套</b>：可以留空。留空时后端会通过私钥自动派生，长期跑更省心；如果你已有固定三件套，也可以三项一起填写。</li>
+    <li><b>稳定性建议</b>：优先使用“私钥自主派生三件套”的方式。它减少手填错误，也避免 API key 过期或抄错导致 401。</li>
+  </ul>
+  <h3>通知和模型</h3>
+  <p>方糖 SendKey 建议填到“通知报告”页。模型 Key 仍放在本页加密 vault 中；模型 Base URL 已内置，只有自定义接口需要填 Base URL。</p>
+  <h3>安全建议</h3>
+  <p>VPS 只保存浏览器加密后的密文。解锁密码不要和账号密码相同；实盘钱包只放可承受损失的小额 USDC。</p>
+`);
+$("strategyHelpBtn").onclick = () => showGuide("三连反转策略说明", `
+  <p>策略只在策略任务和回测页使用，和手动交易页的方向预测无关。</p>
+  <ul>
+    <li><b>三连阴转UP</b>：连续 3 根 15m 阴线后，从下一轮开始只买 UP。</li>
+    <li><b>三连阳转DOWN</b>：连续 3 根 15m 阳线后，从下一轮开始只买 DOWN。</li>
+    <li><b>加注</b>：首单失败后下一轮按计算好的金额加注，最多跑设定单数。</li>
+    <li><b>模拟任务</b>：长期轮询 K 线，只记录信号和任务状态，不真实下单。</li>
+    <li><b>实盘任务</b>：默认隐藏，必须二次确认后进入；当前后端仍保留安全闸门，未接入真实自动执行前不会盲目下单。</li>
+  </ul>
+`);
+$("liveHelpBtn").onclick = $("strategyHelpBtn").onclick;
 
 function updateModelProviderUi(data = {}) {
   if (data.providers) modelProviders = data.providers;

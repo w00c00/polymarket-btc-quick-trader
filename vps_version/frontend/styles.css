@@ -181,9 +181,23 @@ tr.selected {
   margin-bottom: 12px;
   padding: 10px 12px;
 }
+.notice.warn {
+  background: #fffbeb;
+  border-color: #fcd34d;
+  color: #92400e;
+}
 h2 {
   font-size: 16px;
   margin: 18px 0 8px;
+}
+.manual-layout {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1.15fr) minmax(360px, 0.85fr);
+}
+.manual-left,
+.manual-right {
+  min-width: 0;
 }
 .top-grid {
   align-items: stretch;
@@ -252,9 +266,51 @@ h2 {
 .pnl-neg {
   color: #b91c1c;
 }
+dialog {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  box-shadow: 0 24px 80px rgba(15, 23, 42, 0.28);
+  max-width: min(760px, calc(100vw - 32px));
+  padding: 0;
+}
+dialog::backdrop {
+  background: rgba(15, 23, 42, 0.38);
+}
+.modal-head {
+  align-items: center;
+  border-bottom: 1px solid #e5e7eb;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 14px 16px;
+}
+.modal-head h2 {
+  margin: 0;
+}
+.guide-content {
+  color: #334155;
+  line-height: 1.55;
+  max-height: min(70vh, 720px);
+  overflow: auto;
+  padding: 16px 18px;
+}
+.guide-content h3 {
+  color: #111827;
+  font-size: 15px;
+  margin: 12px 0 6px;
+}
+.guide-content p {
+  color: #334155;
+  margin: 0 0 10px;
+}
+.guide-content ul {
+  margin: 8px 0 14px;
+  padding-left: 20px;
+}
 @media (max-width: 820px) {
   header,
-  .top-grid {
+  .top-grid,
+  .manual-layout {
     grid-template-columns: 1fr;
   }
   header {

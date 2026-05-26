@@ -51,7 +51,8 @@
     <div id="sessionBanner" class="status-line ok">已登录</div>
     <nav>
       <button class="tab active" data-tab="manual">手动交易</button>
-      <button class="tab" data-tab="strategy">策略任务</button>
+      <button class="tab" data-tab="strategy">策略任务（模拟）</button>
+      <button id="liveTabBtn" class="tab hidden" data-tab="liveStrategy">策略任务（实盘）</button>
       <button class="tab" data-tab="backtest">回测</button>
       <button class="tab" data-tab="vault">凭证</button>
       <button class="tab" data-tab="models">模型</button>
@@ -60,8 +61,8 @@
     </nav>
 
     <section id="manual" class="panel active">
-      <div class="top-grid">
-        <div>
+      <div class="manual-layout">
+        <div class="manual-left">
           <div class="toolbar">
             <button id="healthBtn">连接测试</button>
             <button id="scanBtn">扫描短周期市场</button>
@@ -69,8 +70,22 @@
             <button id="snapshotBtn">刷新余额/持仓</button>
           </div>
           <div id="selectedMarketBox" class="status-line">未选择市场</div>
+          <table>
+            <thead><tr><th>选择</th><th>周期</th><th>北京时间</th><th>Up</th><th>Down</th><th>量</th><th>市场</th></tr></thead>
+            <tbody id="marketsBody"></tbody>
+          </table>
         </div>
-        <div id="snapshotSummary" class="metric-row"></div>
+        <div class="manual-right">
+          <div id="snapshotSummary" class="metric-row"></div>
+          <h2>方向预测</h2>
+          <div class="notice">手动交易页只做“选中市场/选中周期”的 UP/DOWN 方向概率判断，不使用三连反转策略。</div>
+          <pre id="predictionBox">尚未预测。</pre>
+          <h2>持仓</h2>
+          <table>
+            <thead><tr><th>方向</th><th>数量</th><th>均价</th><th>现价</th><th>现值</th><th>浮盈亏</th><th>操作</th><th>市场</th></tr></thead>
+            <tbody id="positionsBody"></tbody>
+          </table>
+        </div>
       </div>
       <div class="form-grid compact">
         <label>买入金额 USDC <input id="manualAmount" type="number" value="5" step="0.1"></label>
@@ -80,20 +95,12 @@
         <button id="buyUpBtn">买入 UP</button>
         <button id="buyDownBtn">买入 DOWN</button>
       </div>
-      <table>
-        <thead><tr><th>选择</th><th>周期</th><th>北京时间</th><th>Up</th><th>Down</th><th>量</th><th>市场</th></tr></thead>
-        <tbody id="marketsBody"></tbody>
-      </table>
-      <h2>持仓</h2>
-      <table>
-        <thead><tr><th>方向</th><th>数量</th><th>均价</th><th>现价</th><th>现值</th><th>浮盈亏</th><th>操作</th><th>市场</th></tr></thead>
-        <tbody id="positionsBody"></tbody>
-      </table>
       <pre id="manualBox"></pre>
     </section>
 
     <section id="strategy" class="panel">
-      <div class="notice">正反两个策略可以同时 dry-run。实盘同时开启会占用双倍本金，且同一轮可能互相对冲，界面会按方向分别显示状态。</div>
+      <div class="notice">这里仅运行三连反转策略的模拟任务，不会真实下单。手动交易页的方向预测与这里的三连逻辑互不影响。</div>
+      <button id="strategyHelpBtn" class="secondary">策略逻辑说明</button>
       <div class="form-grid">
         <label>策略
           <select id="liveMode">
@@ -104,16 +111,62 @@
         <label>首单U <input id="liveInitial" type="number" value="5" step="0.1"></label>
         <label>最多单数 <input id="liveLayers" type="number" value="3" min="1" max="10"></label>
         <label>最高入场价 <input id="liveEntry" type="number" value="0.50" step="0.01"></label>
-        <label>最多小时 <input id="liveHours" type="number" value="24" step="1"></label>
+        <label>运行周期
+          <select id="liveDurationPreset">
+            <option value="24">24小时</option>
+            <option value="72">3天</option>
+            <option value="168">1周</option>
+            <option value="720">1月</option>
+            <option value="2160">3月</option>
+            <option value="8760">1年</option>
+            <option value="custom">自定义小时</option>
+          </select>
+        </label>
+        <label id="liveHoursWrap" class="hidden">自定义小时 <input id="liveHours" type="number" value="24" step="1"></label>
       </div>
       <div class="toolbar">
         <button id="startDryRunBtn">启动选中策略 dry-run</button>
         <button id="startBothDryRunBtn">同时启动正反 dry-run</button>
+        <button id="enableLiveBtn" class="danger">开启实盘页</button>
         <button id="stopLiveBtn">停止全部</button>
         <button id="liveStatusBtn">刷新状态</button>
       </div>
       <div id="liveCards" class="cards"></div>
       <pre id="liveBox"></pre>
+    </section>
+
+    <section id="liveStrategy" class="panel">
+      <div class="notice warn">实盘页默认隐藏。开启前请确认凭证已解锁、策略参数已在模拟页跑过，并接受连续亏损时的加注本金占用。</div>
+      <button id="liveHelpBtn" class="secondary">策略逻辑说明</button>
+      <div class="form-grid">
+        <label>实盘策略
+          <select id="realMode">
+            <option>三连阴转UP</option>
+            <option>三连阳转DOWN</option>
+          </select>
+        </label>
+        <label>首单U <input id="realInitial" type="number" value="5" step="0.1"></label>
+        <label>最多单数 <input id="realLayers" type="number" value="3" min="1" max="10"></label>
+        <label>最高入场价 <input id="realEntry" type="number" value="0.50" step="0.01"></label>
+        <label>运行周期
+          <select id="realDurationPreset">
+            <option value="24">24小时</option>
+            <option value="72">3天</option>
+            <option value="168">1周</option>
+            <option value="720">1月</option>
+            <option value="2160">3月</option>
+            <option value="8760">1年</option>
+            <option value="custom">自定义小时</option>
+          </select>
+        </label>
+        <label id="realHoursWrap" class="hidden">自定义小时 <input id="realHours" type="number" value="24" step="1"></label>
+      </div>
+      <div class="toolbar">
+        <button id="startRealBtn" class="danger">启动选中策略实盘</button>
+        <button id="startBothRealBtn" class="danger">同时启动正反实盘</button>
+        <button id="realStatusBtn">刷新状态</button>
+      </div>
+      <pre id="realBox"></pre>
     </section>
 
     <section id="backtest" class="panel">
@@ -139,6 +192,7 @@
 
     <section id="vault" class="panel">
       <div class="notice">加密在当前浏览器完成。VPS 磁盘只保存密文；解锁后凭证只放在后端内存。</div>
+      <button id="credentialGuideBtn" class="secondary">凭证填写指南</button>
       <div class="form-grid">
         <label>Polygon 私钥 <input id="privKey" type="password" autocomplete="off"></label>
         <label>Funder 地址 <input id="funder" autocomplete="off"></label>
@@ -146,7 +200,7 @@
         <label>CLOB API Key <input id="apiKey" autocomplete="off"></label>
         <label>CLOB Secret <input id="apiSecret" type="password" autocomplete="off"></label>
         <label>Passphrase <input id="apiPassphrase" type="password" autocomplete="off"></label>
-        <label>Server 酱 SendKey <input id="serverChan" type="password" autocomplete="off"></label>
+        <label>Server 酱 SendKey（旧位置，可留空） <input id="serverChan" type="password" autocomplete="off"></label>
         <label>MiniMax Key <input id="minimax" type="password" autocomplete="off"></label>
         <label>OpenAI Key <input id="openaiKey" type="password" autocomplete="off"></label>
         <label>Anthropic Key <input id="anthropicKey" type="password" autocomplete="off"></label>
@@ -197,12 +251,23 @@
     </section>
 
     <section id="notify" class="panel">
+      <div class="notice">方糖和 Telegram 任意配置一个即可发送报告；两个都填写时会同时发送。方糖 SendKey 建议放在这里，凭证页里的旧字段仅用于兼容。</div>
       <div class="form-grid">
+        <label>方糖 / Server 酱 SendKey <input id="notifyServerChan" type="password" autocomplete="off"></label>
         <label>Telegram Bot Token <input id="telegramToken" type="password" autocomplete="off"></label>
         <label>Telegram Chat ID <input id="telegramChat" autocomplete="off"></label>
         <label>每日报告时间
           <input id="dailyReportTime" type="time" value="21:30">
         </label>
+        <label>手动报告周期
+          <select id="reportPeriod">
+            <option value="day">按日：最近24小时</option>
+            <option value="week">按周：最近7天</option>
+            <option value="month">按月：最近30天</option>
+            <option value="custom">自定义小时</option>
+          </select>
+        </label>
+        <label id="reportHoursWrap" class="hidden">自定义小时 <input id="reportHours" type="number" value="24" min="1" max="8760"></label>
       </div>
       <div class="toolbar">
         <button id="loadNotifyBtn">读取通知设置</button>
@@ -228,6 +293,14 @@
 
     </section>
   </main>
+
+  <dialog id="guideDialog">
+    <div class="modal-head">
+      <h2 id="guideTitle">说明</h2>
+      <button id="guideCloseBtn" class="secondary">关闭</button>
+    </div>
+    <div id="guideContent" class="guide-content"></div>
+  </dialog>
 
   <script src="/static/app.js"></script>
 </body>

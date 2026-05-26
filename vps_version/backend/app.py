@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import ApiCreds
+from py_clob_client_v2.clob_types import ApiCreds, TradeParams
 
 from auth import UserStore
 from core import (
@@ -95,7 +95,7 @@ class PredictRequest(BaseModel):
 
 class LiveStartRequest(CapitalRequest):
     mode: str = REVERSAL_MODE_RED_UP
-    max_hours: float = Field(gt=0, le=168, default=24)
+    max_hours: float = Field(gt=0, le=8760, default=24)
     dry_run: bool = True
 
 
@@ -120,9 +120,15 @@ class PositionSellRequest(BaseModel):
 
 
 class NotificationSettings(BaseModel):
+    server_chan_sendkey: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     daily_report_time: str = Field(default="21:30", pattern=r"^\d{2}:\d{2}$")
+
+
+class ReportRequest(BaseModel):
+    period: str = Field(default="day", pattern="^(day|week|month|custom)$")
+    hours: int | None = Field(default=None, ge=1, le=8760)
 
 
 class ModelSettings(BaseModel):
@@ -282,17 +288,117 @@ def position_summary(positions):
     }
 
 
-def report_markdown(username: str, summary: dict, user_job_map: dict):
+def balance_snapshot(balance):
+    if not isinstance(balance, dict):
+        return {"raw": str(balance)}
+    candidates = {}
+    for key in ["balance", "allowance", "usdc", "collateral", "available", "available_balance"]:
+        if key in balance:
+            candidates[key] = balance[key]
+    return candidates or balance
+
+
+def trade_value(trade):
+    price = float_or_zero(trade.get("price") or trade.get("matchPrice"))
+    size = float_or_zero(trade.get("size") or trade.get("amount") or trade.get("matchedAmount"))
+    return price * size
+
+
+def trade_label_time(trade):
+    value = trade.get("created_at") or trade.get("createdAt") or trade.get("timestamp") or trade.get("matchTime")
+    if isinstance(value, (int, float)):
+        if value > 10_000_000_000:
+            value = value / 1000
+        return datetime.fromtimestamp(value, tz=timezone.utc).astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
+    return str(value or "--")[:16]
+
+
+def summarize_trades(trades):
+    total_value = sum(trade_value(t) for t in trades)
+    return {
+        "count": len(trades),
+        "total_value": total_value,
+        "items": trades[:20],
+    }
+
+
+async def fetch_trade_history(client, hours: int):
+    after = int(time.time() - hours * 3600)
+    try:
+        trades = await asyncio.wait_for(asyncio.to_thread(client.get_trades, TradeParams(after=after), True), timeout=20)
+        return trades if isinstance(trades, list) else []
+    except Exception as exc:
+        return [{"warning": f"成交记录接口不可用: {exc}"}]
+
+
+async def fetch_open_orders(client):
+    try:
+        orders = await asyncio.wait_for(asyncio.to_thread(client.get_open_orders, None, True), timeout=20)
+        return orders if isinstance(orders, list) else []
+    except Exception as exc:
+        return [{"warning": f"未成交订单接口不可用: {exc}"}]
+
+
+async def fetch_balance(client):
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(client.get_balance_allowance, {}), timeout=12)
+    except Exception as exc:
+        return {"warning": f"余额接口不可用: {exc}"}
+
+
+def report_hours(req: ReportRequest | None):
+    if not req:
+        return 24
+    if req.period == "week":
+        return 24 * 7
+    if req.period == "month":
+        return 24 * 30
+    if req.period == "custom" and req.hours:
+        return req.hours
+    return 24
+
+
+def report_period_label(hours: int):
+    if hours == 24:
+        return "最近 24 小时"
+    if hours == 24 * 7:
+        return "最近 7 天"
+    if hours == 24 * 30:
+        return "最近 30 天"
+    return f"最近 {hours} 小时"
+
+
+def report_markdown(username: str, summary: dict, user_job_map: dict, trades=None, open_orders=None, balance=None, hours: int = 24):
+    trade_summary = summarize_trades(trades or [])
+    balance_info = balance_snapshot(balance or {})
     rows = [
-        "### Polymarket 每日交易报告",
+        "### Polymarket 交易报告",
         "",
         f"- 账号: `{username}`",
+        f"- 统计周期: `{report_period_label(hours)}`",
         f"- 时间: `{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M 北京时间')}`",
+        f"- 成交笔数: `{trade_summary['count']}`",
+        f"- 成交名义额: `{trade_summary['total_value']:.2f}` USDC",
+        f"- 未成交挂单: `{len(open_orders or [])}`",
         f"- 持仓数: `{summary['count']}`",
         f"- 总现值: `{summary['total_value']:.2f}` USDC",
-        f"- 总浮盈亏: `{summary['total_pnl']:+.2f}` USDC (`{summary['total_pct']:+.2f}%`)",
+        f"- 当前持仓浮盈亏: `{summary['total_pnl']:+.2f}` USDC (`{summary['total_pct']:+.2f}%`)",
         f"- 运行任务: `{sum(1 for job in user_job_map.values() if job.get('status') == 'running')}`",
+        f"- 实时余额: `{balance_info}`",
     ]
+    if trades:
+        rows.append("")
+        rows.append("成交/订单详情:")
+        for t in trades[:12]:
+            if t.get("warning"):
+                rows.append(f"- {t['warning']}")
+                continue
+            rows.append(
+                f"- {trade_label_time(t)} | {t.get('side') or t.get('takerSide') or '--'} "
+                f"{float_or_zero(t.get('size') or t.get('amount') or t.get('matchedAmount')):.2f} 份 | "
+                f"价 {float_or_zero(t.get('price') or t.get('matchPrice')):.4f} | "
+                f"{str(t.get('title') or t.get('market') or t.get('asset_id') or '')[:80]}"
+            )
     if summary["positions"]:
         rows.append("")
         rows.append("主要持仓:")
@@ -332,7 +438,7 @@ async def notify_user(username: str, title: str, content: str):
         credentials = vault.credentials(username)
     except Exception:
         pass
-    sendkey = credentials.get("sendkey") or settings.get("sendkey") or ""
+    sendkey = settings.get("server_chan_sendkey") or credentials.get("sendkey") or settings.get("sendkey") or ""
     results = {}
     try:
         results["server_chan"] = await push_server_chan(sendkey, title, content)
@@ -345,13 +451,20 @@ async def notify_user(username: str, title: str, content: str):
     return results
 
 
-async def build_account_report(username: str):
+async def build_account_report(username: str, req: ReportRequest | None = None):
     if not vault.status(username)["unlocked"]:
         return None
+    hours = report_hours(req)
+    client, credentials = await clob_client_for(username)
     credentials = vault.credentials(username)
     positions = await fetch_positions_for_credentials(credentials)
     summary = position_summary(positions)
-    return report_markdown(username, summary, user_jobs(username))
+    trades, open_orders, balance = await asyncio.gather(
+        fetch_trade_history(client, hours),
+        fetch_open_orders(client),
+        fetch_balance(client),
+    )
+    return report_markdown(username, summary, user_jobs(username), trades=trades, open_orders=open_orders, balance=balance, hours=hours)
 
 
 async def daily_report_loop():
@@ -368,7 +481,7 @@ async def daily_report_loop():
             if report_time == hhmm and last_sent.get(username) != key:
                 last_sent[username] = key
                 try:
-                    content = await build_account_report(username)
+                    content = await build_account_report(username, ReportRequest(period="day"))
                     if content:
                         await notify_user(username, "Polymarket 每日交易报告", content)
                 except Exception:
@@ -505,7 +618,7 @@ async def save_notification_settings(req: NotificationSettings, username: str = 
 
 @app.get("/api/settings/notifications")
 async def get_notification_settings(username: str = Depends(regular_user)):
-    settings = {"telegram_bot_token": "", "telegram_chat_id": "", "daily_report_time": "21:30"}
+    settings = {"server_chan_sendkey": "", "telegram_bot_token": "", "telegram_chat_id": "", "daily_report_time": "21:30"}
     settings.update(user_store.settings(username))
     return settings
 
@@ -586,11 +699,7 @@ async def trading_snapshot(username: str = Depends(regular_user)):
         client, credentials = await clob_client_for(username)
         positions = await fetch_positions_for_credentials(credentials)
         summary = position_summary(positions)
-        balance = None
-        try:
-            balance = await asyncio.wait_for(asyncio.to_thread(client.get_balance_allowance, {}), timeout=12)
-        except Exception as exc:
-            balance = {"warning": f"余额接口不可用: {exc}"}
+        balance = await fetch_balance(client)
         return {"summary": summary, "balance": balance, "refreshed_at": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S 北京时间")}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -639,7 +748,7 @@ async def manual_order(req: ManualOrderRequest, username: str = Depends(regular_
         await asyncio.sleep(1.5)
         positions = await fetch_positions_for_credentials(credentials)
         summary = position_summary(positions)
-        content = report_markdown(username, summary, user_jobs(username))
+        content = report_markdown(username, summary, user_jobs(username), balance=await fetch_balance(client))
         content = f"### Polymarket 手动交易结果\n\n- 操作: `{req.side} {req.direction}`\n- 价格: `{price:.4f}`\n- 数量: `{size:.4f}`\n- 市场: {req.market.get('question', '')}\n\n{content}"
         notification = await notify_user(username, "Polymarket 手动交易结果", content)
         return {"ok": True, "order": resp, "price": price, "size": size, "quote": quote, "summary": summary, "notification": notification}
@@ -668,7 +777,7 @@ async def sell_position(req: PositionSellRequest, username: str = Depends(regula
             raise ValueError(f"交易所拒绝订单: {resp}")
         positions = await fetch_positions_for_credentials(credentials)
         summary = position_summary(positions)
-        content = f"### Polymarket 限价卖出结果\n\n- 市场: {req.title}\n- 方向: `{req.outcome}`\n- 价格: `{price:.4f}`\n- 数量: `{req.size:.4f}`\n\n{report_markdown(username, summary, user_jobs(username))}"
+        content = f"### Polymarket 限价卖出结果\n\n- 市场: {req.title}\n- 方向: `{req.outcome}`\n- 价格: `{price:.4f}`\n- 数量: `{req.size:.4f}`\n\n{report_markdown(username, summary, user_jobs(username), balance=await fetch_balance(client))}"
         notification = await notify_user(username, "Polymarket 限价卖出结果", content)
         return {"ok": True, "order": resp, "summary": summary, "notification": notification}
     except Exception as exc:
@@ -676,9 +785,9 @@ async def sell_position(req: PositionSellRequest, username: str = Depends(regula
 
 
 @app.post("/api/reports/send_now")
-async def send_report_now(username: str = Depends(regular_user)):
+async def send_report_now(req: ReportRequest = ReportRequest(), username: str = Depends(regular_user)):
     try:
-        content = await build_account_report(username)
+        content = await build_account_report(username, req)
         if not content:
             raise ValueError("请先解锁凭证后再生成报告。")
         notification = await notify_user(username, "Polymarket 每日交易报告", content)
@@ -691,7 +800,7 @@ async def send_report_now(username: str = Depends(regular_user)):
 async def strategy_predict(req: PredictRequest):
     try:
         rows = await market_data.fetch_btc_15m_klines(req.days)
-        return local_btc_probability_from_rows(rows, req.market)
+        return local_btc_probability_from_rows(rows, req.market, include_reversal=False)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

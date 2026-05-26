@@ -361,7 +361,7 @@ def rsi_from_closes(closes, period=14):
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def local_btc_probability_from_rows(rows, market=None):
+def local_btc_probability_from_rows(rows, market=None, include_reversal=True):
     if len(rows) < 40:
         raise ValueError("K 线数量不足，无法预测。")
     closes = [float(row[4]) for row in rows]
@@ -382,12 +382,14 @@ def local_btc_probability_from_rows(rows, market=None):
     score += max(min((rsi - 50.0) / 260.0, 0.11), -0.11)
 
     reversal_hint = "无明显三连反转"
-    if recent_red:
+    if include_reversal and recent_red:
         score += 0.07
         reversal_hint = "三连阴后偏反弹"
-    elif recent_green:
+    elif include_reversal and recent_green:
         score -= 0.07
         reversal_hint = "三连阳后偏回落"
+    elif not include_reversal:
+        reversal_hint = "手动方向预测未启用三连反转加权"
 
     up_probability = min(0.82, max(0.18, 0.5 + score))
     down_probability = 1.0 - up_probability
